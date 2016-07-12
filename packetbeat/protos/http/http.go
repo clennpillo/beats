@@ -389,21 +389,6 @@ func (http *HTTP) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	return private, false
 }
 
-func (http *HTTP) RemovalListener(data protos.ProtocolData) {
-	if conn, ok := data.(*httpConnectionData); ok {
-		if !conn.requests.empty() && conn.responses.empty() {
-			requ := conn.requests.pop()
-			resp := &message{
-				StatusCode: 700,
-			}
-			result := http.newTransaction(requ, resp)
-			http.results.PublishTransaction(result)
-		}
-	} else {
-		logp.Warn("Not a httpConnectionData")
-	}
-}
-
 func (http *HTTP) handleHTTP(
 	conn *httpConnectionData,
 	m *message,
