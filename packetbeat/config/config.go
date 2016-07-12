@@ -43,6 +43,9 @@ type Protocols struct {
 	Pgsql    Pgsql
 	Redis    Redis
 	Thrift   Thrift
+	
+	// Adding protocols
+	Drda	 Drda
 }
 
 type ProtocolCommon struct {
@@ -115,6 +118,13 @@ type Thrift struct {
 }
 
 type Redis struct {
+	ProtocolCommon `yaml:",inline"`
+}
+
+type Drda struct {
+    Max_row_length int
+	Max_rows       int
+	
 	ProtocolCommon `yaml:",inline"`
 }
 
