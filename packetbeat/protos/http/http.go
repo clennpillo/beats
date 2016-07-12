@@ -2,10 +2,11 @@ package http
 
 import (
 	"bytes"
-	"fmt"
 	"net/url"
 	"strings"
 	"time"
+	_ "fmt"
+	_ "strconv"
 
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
@@ -388,6 +389,21 @@ func (http *HTTP) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	return private, false
 }
 
+func (http *HTTP) RemovalListener(data protos.ProtocolData) {
+	if conn, ok := data.(*httpConnectionData); ok {
+		if !conn.requests.empty() && conn.responses.empty() {
+			requ := conn.requests.pop()
+			resp := &message{
+				StatusCode: 700,
+			}
+			result := http.newTransaction(requ, resp)
+			http.results.PublishTransaction(result)
+		}
+	} else {
+		logp.Warn("Not a httpConnectionData")
+	}
+}
+
 func (http *HTTP) handleHTTP(
 	conn *httpConnectionData,
 	m *message,
@@ -466,9 +482,11 @@ func (http *HTTP) newTransaction(requ, resp *message) common.MapStr {
 	}
 
 	details := common.MapStr{
-		"phrase":         resp.StatusPhrase,
-		"code":           resp.StatusCode,
-		"content_length": resp.ContentLength,
+//		"phrase":         resp.StatusPhrase,
+//		"content_length": resp.ContentLength,
+		"method":         requ.Method,
+		"path":           path,
+		"params":         params,
 	}
 	if http.parserConfig.SendHeaders {
 		details["request_headers"] = http.collectHeaders(requ)
@@ -480,15 +498,16 @@ func (http *HTTP) newTransaction(requ, resp *message) common.MapStr {
 		"type":         "http",
 		"status":       status,
 		"responsetime": responseTime,
-		"method":       requ.Method,
-		"path":         path,
-		"params":       params,
-		"query":        fmt.Sprintf("%s %s", requ.Method, path),
-		"http":         details,
+		"kpi":          details,
+		"return_code":  resp.StatusCode,
 		"bytes_out":    resp.Size,
 		"bytes_in":     requ.Size,
 		"src":          &src,
 		"dst":          &dst,
+	}
+	
+	if resp.Ts.IsZero() {
+		event["respond_status"] = "FAIL"
 	}
 
 	if http.SendRequest {
