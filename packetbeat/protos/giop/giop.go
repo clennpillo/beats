@@ -295,11 +295,7 @@ func (giop *Giop) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 
 	// don't drop the stream, we can ignore the gap
 	return private, false
-}
-	
-func (giop *Giop) RemovalListener(data protos.ProtocolData){
-
-}			
+}		
 
 func (giop *Giop) handleGiop(
 	conn *giopConnectionData,
