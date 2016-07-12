@@ -84,6 +84,9 @@ type TcpProtocolPlugin interface {
 	// ConnectionTimeout returns the per stream connection timeout.
 	// Return <=0 to set default tcp module transaction timeout.
 	ConnectionTimeout() time.Duration
+	
+	// Cache Removal Listener
+	RemovalListener(data ProtocolData)
 }
 
 type UdpProtocolPlugin interface {

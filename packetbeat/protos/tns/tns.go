@@ -346,6 +346,10 @@ func (tns *Tns) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	// don't drop the stream, we can ignore the gap
 	return private, false
 }
+	
+func (tns *Tns) RemovalListener(data protos.ProtocolData) {
+	
+}		
 
 func (tns *Tns) handleTns(
 	conn *tnsConnectionData,

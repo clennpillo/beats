@@ -242,14 +242,28 @@ func NewTcp(p protos.Protocols) (*Tcp, error) {
 	tcp := &Tcp{
 		protocols: p,
 		portMap:   portMap,
-		streams: common.NewCache(
-			protos.DefaultTransactionExpiration,
-			protos.DefaultTransactionHashSize),
 	}
+	tcp.streams = common.NewCacheWithRemovalListener(
+		protos.DefaultTransactionExpiration,
+		protos.DefaultTransactionHashSize,
+	    func(k common.Key, v common.Value) {
+	    	tcp.removalListener(k, v)
+	    })
 	tcp.streams.StartJanitor(protos.DefaultTransactionExpiration)
 	if isDebug {
 		debugf("tcp", "Port map: %v", portMap)
 	}
 
 	return tcp, nil
+}
+
+func (tcp *Tcp) removalListener(k common.Key, v common.Value){
+	if conn, ok := v.(*TcpConnection); ok {
+		if conn.data == nil {
+			return
+		}
+		
+		mod := conn.tcp.protocols.GetTcp(conn.protocol)
+		mod.RemovalListener(conn.data)
+	}
 }
