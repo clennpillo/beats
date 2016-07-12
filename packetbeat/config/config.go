@@ -46,6 +46,7 @@ type Protocols struct {
 	
 	// Adding protocols
 	Drda	 Drda
+	Tns	     Tns
 }
 
 type ProtocolCommon struct {
@@ -126,6 +127,10 @@ type Drda struct {
 	Max_rows       int
 	
 	ProtocolCommon `yaml:",inline"`
+}
+
+type Tns struct {
+	ProtocolCommon 		  `yaml:",inline"`
 }
 
 // Config Singleton

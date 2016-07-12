@@ -109,6 +109,7 @@ const (
 	MemcacheProtocol
 	
 	DrdaProtocol
+	TnsProtocol
 )
 
 // Protocol names
@@ -124,6 +125,7 @@ var ProtocolNames = []string{
 	"memcache",
 	
 	"drda",
+	"tns",
 }
 
 func (p Protocol) String() string {

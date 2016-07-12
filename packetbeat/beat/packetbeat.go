@@ -34,7 +34,7 @@ import (
 	
 	// Adding protocols
 	"github.com/elastic/beats/packetbeat/protos/drda"
-
+	"github.com/elastic/beats/packetbeat/protos/tns"
 )
 
 var EnabledProtocolPlugins map[protos.Protocol]protos.ProtocolPlugin = map[protos.Protocol]protos.ProtocolPlugin{
@@ -48,6 +48,7 @@ var EnabledProtocolPlugins map[protos.Protocol]protos.ProtocolPlugin = map[proto
 	protos.DnsProtocol:      new(dns.Dns),
 	
 	protos.DrdaProtocol:      new(drda.Drda),
+	protos.TnsProtocol:      new(tns.Tns),
 }
 
 var EnabledFilterPlugins map[filters.Filter]filters.FilterPlugin = map[filters.Filter]filters.FilterPlugin{
