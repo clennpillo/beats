@@ -110,6 +110,7 @@ const (
 	
 	DrdaProtocol
 	TnsProtocol
+	GiopProtocol
 )
 
 // Protocol names
@@ -126,6 +127,7 @@ var ProtocolNames = []string{
 	
 	"drda",
 	"tns",
+	"giop",
 }
 
 func (p Protocol) String() string {
