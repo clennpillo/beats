@@ -424,10 +424,6 @@ func (drda *Drda) ReceivedFin(tcptuple *common.TcpTuple, dir uint8,
 	// memory or send it up the stack.
 	return private
 }
-
-func (drda *Drda) RemovalListener(data protos.ProtocolData){
-
-}		
 	
 func (ml *messageList) append(msg *message) {
 	if ml.tail == nil {
