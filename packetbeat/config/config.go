@@ -48,6 +48,7 @@ type Protocols struct {
 	Drda	 Drda
 	Tns	     Tns
 	Giop     Giop
+	Mq		 Mq
 }
 
 type ProtocolCommon struct {
@@ -135,6 +136,10 @@ type Tns struct {
 }
 
 type Giop struct {
+	ProtocolCommon 		  `yaml:",inline"`
+}
+
+type Mq struct {
 	ProtocolCommon 		  `yaml:",inline"`
 }
 
