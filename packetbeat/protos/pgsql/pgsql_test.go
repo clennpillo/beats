@@ -1,3 +1,5 @@
+// +build !integration
+
 package pgsql
 
 import (
@@ -14,16 +16,17 @@ import (
 	"github.com/elastic/beats/packetbeat/publish"
 )
 
-func PgsqlModForTests() *Pgsql {
-	var pgsql Pgsql
+func pgsqlModForTests() *pgsqlPlugin {
+	var pgsql pgsqlPlugin
 	results := &publish.ChanTransactions{make(chan common.MapStr, 10)}
-	pgsql.Init(true, results)
+	config := defaultConfig
+	pgsql.init(results, &config)
 	return &pgsql
 }
 
 // Test parsing a request with a single query
 func TestPgsqlParser_simpleRequest(t *testing.T) {
-	pgsql := PgsqlModForTests()
+	pgsql := pgsqlModForTests()
 
 	data := []byte(
 		"510000001a53454c454354202a2046524f4d20466f6f6261723b00")
@@ -33,7 +36,7 @@ func TestPgsqlParser_simpleRequest(t *testing.T) {
 		t.Error("Failed to decode hex string")
 	}
 
-	stream := &PgsqlStream{data: message, message: new(PgsqlMessage)}
+	stream := &pgsqlStream{data: message, message: new(pgsqlMessage)}
 
 	ok, complete := pgsql.pgsqlMessageParser(stream)
 
@@ -43,21 +46,24 @@ func TestPgsqlParser_simpleRequest(t *testing.T) {
 	if !complete {
 		t.Error("Expecting a complete message")
 	}
-	if !stream.message.IsRequest {
+	if !stream.message.isRequest {
 		t.Error("Failed to parse postgres request")
 	}
-	if stream.message.Query != "SELECT * FROM Foobar;" {
+	if stream.message.query != "SELECT * FROM Foobar;" {
 		t.Error("Failed to parse query")
 	}
-	if stream.message.Size != 27 {
-		t.Errorf("Wrong message size %d", stream.message.Size)
+	if stream.message.size != 27 {
+		t.Errorf("Wrong message size %d", stream.message.size)
 	}
 }
 
 // Test parsing a response with data attached
 func TestPgsqlParser_dataResponse(t *testing.T) {
+	if testing.Verbose() {
+		logp.LogInit(logp.LOG_DEBUG, "", false, true, []string{"pgsql", "pgsqldetailed"})
+	}
 
-	pgsql := PgsqlModForTests()
+	pgsql := pgsqlModForTests()
 	data := []byte(
 		"5400000033000269640000008fc40001000000170004ffffffff000076616c75650000008fc4000200000019ffffffffffff0000" +
 			"44000000130002000000013100000004746f746f" +
@@ -71,7 +77,7 @@ func TestPgsqlParser_dataResponse(t *testing.T) {
 		t.Error("Failed to decode hex string")
 	}
 
-	stream := &PgsqlStream{data: message, message: new(PgsqlMessage)}
+	stream := &pgsqlStream{data: message, message: new(pgsqlMessage)}
 
 	ok, complete := pgsql.pgsqlMessageParser(stream)
 
@@ -81,28 +87,28 @@ func TestPgsqlParser_dataResponse(t *testing.T) {
 	if !complete {
 		t.Error("Expecting a complete message")
 	}
-	if stream.message.IsRequest {
+	if stream.message.isRequest {
 		t.Error("Failed to parse postgres response")
 	}
-	if !stream.message.IsOK || stream.message.IsError {
+	if !stream.message.isOK || stream.message.isError {
 		t.Error("Failed to parse postgres response")
 	}
-	if stream.message.NumberOfFields != 2 {
+	if stream.message.numberOfFields != 2 {
 		t.Error("Failed to parse the number of field")
 	}
-	if stream.message.NumberOfRows != 3 {
+	if stream.message.numberOfRows != 3 {
 		t.Error("Failed to parse the number of rows")
 	}
 
-	if stream.message.Size != 126 {
-		t.Errorf("Wrong message size %d", stream.message.Size)
+	if stream.message.size != 126 {
+		t.Errorf("Wrong message size %d", stream.message.size)
 	}
 }
 
 // Test parsing a pgsql response
 func TestPgsqlParser_response(t *testing.T) {
 
-	pgsql := PgsqlModForTests()
+	pgsql := pgsqlModForTests()
 	data := []byte(
 		"54000000420003610000004009000100000413ffffffffffff0000620000004009000200000413ffffffffffff0000630000004009000300000413ffffffffffff0000" +
 			"440000001b0003000000036d6561000000036d6562000000036d6563" +
@@ -117,7 +123,7 @@ func TestPgsqlParser_response(t *testing.T) {
 		t.Error("Failed to decode hex string")
 	}
 
-	stream := &PgsqlStream{data: message, message: new(PgsqlMessage)}
+	stream := &pgsqlStream{data: message, message: new(pgsqlMessage)}
 
 	ok, complete := pgsql.pgsqlMessageParser(stream)
 
@@ -127,21 +133,21 @@ func TestPgsqlParser_response(t *testing.T) {
 	if !complete {
 		t.Error("Expecting a complete message")
 	}
-	if stream.message.IsRequest {
+	if stream.message.isRequest {
 		t.Error("Failed to parse postgres response")
 	}
-	if !stream.message.IsOK || stream.message.IsError {
+	if !stream.message.isOK || stream.message.isError {
 		t.Error("Failed to parse postgres response")
 	}
-	if stream.message.NumberOfFields != 3 {
+	if stream.message.numberOfFields != 3 {
 		t.Error("Failed to parse the number of field")
 	}
-	if stream.message.NumberOfRows != 4 {
+	if stream.message.numberOfRows != 4 {
 		t.Error("Failed to parse the number of rows")
 	}
 
-	if stream.message.Size != 202 {
-		t.Errorf("Wrong message size %d", stream.message.Size)
+	if stream.message.size != 202 {
+		t.Errorf("Wrong message size %d", stream.message.size)
 	}
 }
 
@@ -150,7 +156,7 @@ func TestPgsqlParser_incomplete_response(t *testing.T) {
 	if testing.Verbose() {
 		logp.LogInit(logp.LOG_DEBUG, "", false, true, []string{"pgsql", "pgsqldetailed"})
 	}
-	pgsql := PgsqlModForTests()
+	pgsql := pgsqlModForTests()
 
 	data := []byte(
 		"54000000420003610000004009000100000413ffffffffffff0000620000004009000200000413ffffffffffff0000630000004009000300000413ffffffffffff0000" +
@@ -163,7 +169,7 @@ func TestPgsqlParser_incomplete_response(t *testing.T) {
 		t.Error("Failed to decode hex string")
 	}
 
-	stream := &PgsqlStream{data: message, message: new(PgsqlMessage)}
+	stream := &pgsqlStream{data: message, message: new(pgsqlMessage)}
 
 	ok, complete := pgsql.pgsqlMessageParser(stream)
 
@@ -179,7 +185,7 @@ func TestPgsqlParser_incomplete_response(t *testing.T) {
 // Test 3 responses in a row
 func TestPgsqlParser_threeResponses(t *testing.T) {
 
-	pgsql := PgsqlModForTests()
+	pgsql := pgsqlModForTests()
 
 	data, err := hex.DecodeString(
 		"5300000017446174655374796c650049534f2c204d445900430000000853455400430000000853455400540000005700036f696400000004eefffe0000001a0004ffffffff0000656e636f64696e6700000000000000000000130040ffffffff00006461746c6173747379736f696400000004ee00090000001a0004ffffffff0000440000002000030000000531313836350000000455544638000000053131383537430000000d53454c4543542031005a0000000549")
@@ -195,19 +201,19 @@ func TestPgsqlParser_threeResponses(t *testing.T) {
 		Payload: data,
 		Ts:      ts,
 	}
-	var tuple common.TcpTuple
+	var tuple common.TCPTuple
 	var private pgsqlPrivateData
-	var count_handlePgsql = 0
+	var countHandlePgsql = 0
 
-	pgsql.handlePgsql = func(pgsql *Pgsql, m *PgsqlMessage, tcptuple *common.TcpTuple,
+	pgsql.handlePgsql = func(pgsql *pgsqlPlugin, m *pgsqlMessage, tcptuple *common.TCPTuple,
 		dir uint8, raw_msg []byte) {
 
-		count_handlePgsql += 1
+		countHandlePgsql++
 	}
 
 	pgsql.Parse(&pkt, &tuple, 1, private)
 
-	if count_handlePgsql != 3 {
+	if countHandlePgsql != 3 {
 		t.Error("handlePgsql not called three times")
 	}
 
@@ -215,7 +221,11 @@ func TestPgsqlParser_threeResponses(t *testing.T) {
 
 // Test parsing an error response
 func TestPgsqlParser_errorResponse(t *testing.T) {
-	pgsql := PgsqlModForTests()
+	if testing.Verbose() {
+		logp.LogInit(logp.LOG_DEBUG, "", false, true, []string{"pgsql", "pgsqldetailed"})
+	}
+
+	pgsql := pgsqlModForTests()
 	data := []byte(
 		"4500000088534552524f5200433235503032004d63757272656e74207472616e73616374696f6e2069732061626f727465642c20636f6d6d616e64732069676e6f72656420756e74696c20656e64206f66207472616e73616374696f6e20626c6f636b0046706f7374677265732e63004c3932310052657865635f73696d706c655f71756572790000")
 
@@ -224,7 +234,7 @@ func TestPgsqlParser_errorResponse(t *testing.T) {
 		t.Error("Failed to decode hex string")
 	}
 
-	stream := &PgsqlStream{data: message, message: new(PgsqlMessage)}
+	stream := &pgsqlStream{data: message, message: new(pgsqlMessage)}
 
 	ok, complete := pgsql.pgsqlMessageParser(stream)
 
@@ -235,23 +245,23 @@ func TestPgsqlParser_errorResponse(t *testing.T) {
 		t.Error("Expecting a complete message")
 	}
 
-	if stream.message.IsRequest {
+	if stream.message.isRequest {
 		t.Error("Failed to parse postgres response")
 	}
-	if !stream.message.IsError {
+	if !stream.message.isError {
 		t.Error("Failed to parse error response")
 	}
-	if stream.message.ErrorSeverity != "ERROR" {
+	if stream.message.errorSeverity != "ERROR" {
 		t.Error("Failed to parse severity")
 	}
-	if stream.message.ErrorCode != "25P02" {
+	if stream.message.errorCode != "25P02" {
 		t.Error("Failed to parse error code")
 	}
-	if stream.message.ErrorInfo != "current transaction is aborted, commands ignored until end of transaction block" {
+	if stream.message.errorInfo != "current transaction is aborted, commands ignored until end of transaction block" {
 		t.Error("Failed to parse error message")
 	}
-	if stream.message.Size != 137 {
-		t.Errorf("Wrong message size %d", stream.message.Size)
+	if stream.message.size != 137 {
+		t.Errorf("Wrong message size %d", stream.message.size)
 	}
 }
 
@@ -260,7 +270,7 @@ func TestPgsqlParser_invalidMessage(t *testing.T) {
 	if testing.Verbose() {
 		logp.LogInit(logp.LOG_DEBUG, "", false, true, []string{"pgsql", "pgsqldetailed"})
 	}
-	pgsql := PgsqlModForTests()
+	pgsql := pgsqlModForTests()
 	data := []byte(
 		"4300000002")
 
@@ -269,7 +279,7 @@ func TestPgsqlParser_invalidMessage(t *testing.T) {
 		t.Error("Failed to decode hex string")
 	}
 
-	stream := &PgsqlStream{data: message, message: new(PgsqlMessage)}
+	stream := &pgsqlStream{data: message, message: new(pgsqlMessage)}
 
 	ok, complete := pgsql.pgsqlMessageParser(stream)
 
@@ -281,18 +291,18 @@ func TestPgsqlParser_invalidMessage(t *testing.T) {
 	}
 }
 
-func testTcpTuple() *common.TcpTuple {
-	t := &common.TcpTuple{
-		Ip_length: 4,
-		Src_ip:    net.IPv4(192, 168, 0, 1), Dst_ip: net.IPv4(192, 168, 0, 2),
-		Src_port: 6512, Dst_port: 5432,
+func testTCPTuple() *common.TCPTuple {
+	t := &common.TCPTuple{
+		IPLength: 4,
+		SrcIP:    net.IPv4(192, 168, 0, 1), DstIP: net.IPv4(192, 168, 0, 2),
+		SrcPort: 6512, DstPort: 5432,
 	}
 	t.ComputeHashebles()
 	return t
 }
 
 // Helper function to read from the Publisher Queue
-func expectTransaction(t *testing.T, pgsql *Pgsql) common.MapStr {
+func expectTransaction(t *testing.T, pgsql *pgsqlPlugin) common.MapStr {
 	client := pgsql.results.(*publish.ChanTransactions)
 	select {
 	case trans := <-client.Channel:
@@ -310,17 +320,17 @@ func Test_gap_in_response(t *testing.T) {
 		logp.LogInit(logp.LOG_DEBUG, "", false, true, []string{"pgsql", "pgsqldetailed"})
 	}
 
-	pgsql := PgsqlModForTests()
+	pgsql := pgsqlModForTests()
 
 	// request and response from tests/pcaps/pgsql_request_response.pcap
 	// select * from test
-	req_data, err := hex.DecodeString(
+	reqData, err := hex.DecodeString(
 		"510000001873656c656374202a20" +
 			"66726f6d20746573743b00")
 	assert.Nil(t, err)
 
 	// response is incomplete
-	resp_data, err := hex.DecodeString(
+	respData, err := hex.DecodeString(
 		"5400000042000361000000410900" +
 			"0100000413ffffffffffff0000620000" +
 			"004009000200000413ffffffffffff00" +
@@ -332,9 +342,9 @@ func Test_gap_in_response(t *testing.T) {
 			"440000001e0003000000046d65613200")
 	assert.Nil(t, err)
 
-	tcptuple := testTcpTuple()
-	req := protos.Packet{Payload: req_data}
-	resp := protos.Packet{Payload: resp_data}
+	tcptuple := testTCPTuple()
+	req := protos.Packet{Payload: reqData}
+	resp := protos.Packet{Payload: respData}
 
 	private := protos.ProtocolData(new(pgsqlPrivateData))
 
@@ -343,7 +353,7 @@ func Test_gap_in_response(t *testing.T) {
 
 	logp.Debug("pgsql", "Now sending gap..")
 
-	private, drop := pgsql.GapInStream(tcptuple, 1, 10, private)
+	_, drop := pgsql.GapInStream(tcptuple, 1, 10, private)
 	assert.Equal(t, true, drop)
 
 	trans := expectTransaction(t, pgsql)

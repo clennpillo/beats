@@ -7,5 +7,4 @@ the dashboards in Kibana, you can modify them to meet your needs.
 This section includes the following topics:
 
 * <<load-kibana-dashboards>>
-* <<dashboard-load-options>>
 * <<view-kibana-dashboards>>

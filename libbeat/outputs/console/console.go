@@ -4,58 +4,65 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 
 	"github.com/elastic/beats/libbeat/common"
+	"github.com/elastic/beats/libbeat/common/op"
 	"github.com/elastic/beats/libbeat/logp"
 	"github.com/elastic/beats/libbeat/outputs"
 )
 
 func init() {
-	outputs.RegisterOutputPlugin("console", plugin{})
+	outputs.RegisterOutputPlugin("console", New)
 }
 
-type plugin struct{}
+type console struct {
+	config config
+	out    *os.File
+}
 
-func (p plugin) NewOutput(
-	config *outputs.MothershipConfig,
-	topologyExpire int,
-) (outputs.Outputer, error) {
-	pretty := config.Pretty != nil && *config.Pretty
-	c := newConsole(pretty)
+func New(_ string, config *common.Config, _ int) (outputs.Outputer, error) {
+	c := &console{config: defaultConfig, out: os.Stdout}
+	err := config.Unpack(&c.config)
+	if err != nil {
+		return nil, err
+	}
 
 	// check stdout actually being available
-	if _, err := c.out.Stat(); err != nil {
-		return nil, fmt.Errorf("console output initialization failed with: %v", err)
+	if runtime.GOOS != "windows" {
+		if _, err = c.out.Stat(); err != nil {
+			return nil, fmt.Errorf("console output initialization failed with: %v", err)
+		}
 	}
 
 	return c, nil
 }
 
-type console struct {
-	pretty bool
-	out    *os.File
+func newConsole(pretty bool) *console {
+	return &console{config: config{pretty}, out: os.Stdout}
 }
 
-func newConsole(pretty bool) *console {
-	return &console{pretty: pretty, out: os.Stdout}
+// Implement Outputer
+func (c *console) Close() error {
+	return nil
 }
 
 func (c *console) PublishEvent(
-	s outputs.Signaler,
+	s op.Signaler,
 	opts outputs.Options,
-	event common.MapStr,
+	data outputs.Data,
 ) error {
 	var jsonEvent []byte
 	var err error
 
-	if c.pretty {
-		jsonEvent, err = json.MarshalIndent(event, "", "  ")
+	if c.config.Pretty {
+		jsonEvent, err = json.MarshalIndent(data.Event, "", "  ")
 	} else {
-		jsonEvent, err = json.Marshal(event)
+		jsonEvent, err = json.Marshal(data.Event)
 	}
 	if err != nil {
-		logp.Err("Fail to convert the event to JSON: %s", err)
-		outputs.SignalCompleted(s)
+		logp.Err("Fail to convert the event to JSON (%v): %#v", err, data.Event)
+		op.SigCompleted(s)
 		return err
 	}
 
@@ -66,13 +73,13 @@ func (c *console) PublishEvent(
 		goto fail
 	}
 
-	outputs.SignalCompleted(s)
+	op.SigCompleted(s)
 	return nil
 fail:
 	if opts.Guaranteed {
 		logp.Critical("Unable to publish events to console: %v", err)
 	}
-	outputs.SignalFailed(s, err)
+	op.SigFailed(s, err)
 	return err
 }
 

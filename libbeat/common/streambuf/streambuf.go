@@ -1,4 +1,4 @@
-// The streambuf module provides helpers for buffering multiple packet payloads
+// Package streambuf provides helpers for buffering multiple packet payloads
 // and some general parsing functions. All parsing functions are re-entrant,
 // that is if a parse function fails due do not having buffered enough bytes yet
 // (error value ErrNoMoreBytes) the parser can be called again after appending more
@@ -12,7 +12,7 @@
 // All functions that might fail, will return an error. The last error reported
 // will be stored with the buffer itself. Instead of checking every single error
 // one can use the Failed() and Err() methods to check if the buffer is still in a
-// valid state and all parsing was successfull.
+// valid state and all parsing was successful.
 package streambuf
 
 import (
@@ -51,7 +51,7 @@ type Buffer struct {
 
 	// Internal parser state offsets.
 	// Offset is the position a parse might continue to work at when called
-	// again (e.g. usefull for parsing tcp streams.). The mark is used to remember
+	// again (e.g. useful for parsing tcp streams.). The mark is used to remember
 	// the position last parse operation ended at. The variable available is used
 	// for faster lookup
 	// Invariants:
@@ -65,8 +65,11 @@ type Buffer struct {
 // buffer. Usage of Init is optional as zero value Buffer is already in valid state.
 func (b *Buffer) Init(d []byte, fixed bool) {
 	b.data = d
-	b.available = len(d)
+	b.err = nil
 	b.fixed = fixed
+	b.mark = 0
+	b.offset = 0
+	b.available = len(d)
 }
 
 // New creates new extensible buffer from data slice being retained by the buffer.
@@ -218,7 +221,7 @@ func (b *Buffer) Failed() bool {
 	return failed
 }
 
-// Returns the error value of the last failed operation.
+// Err returns the error value of the last failed operation.
 func (b *Buffer) Err() error {
 	return b.err
 }
@@ -265,14 +268,14 @@ func (b *Buffer) Consume(n int) ([]byte, error) {
 		return nil, ErrOutOfRange
 	}
 
-	new_mark := b.mark - n
-	if new_mark < 0 {
+	newMark := b.mark - n
+	if newMark < 0 {
 		return nil, ErrOutOfRange
 	}
 
 	old := b.data[:n]
 	b.data = b.data[n:]
-	b.mark = new_mark
+	b.mark = newMark
 	b.offset -= n
 	b.available = len(b.data) - b.mark
 	return old, nil
@@ -306,9 +309,8 @@ func (b *Buffer) Bytes() []byte {
 func (b *Buffer) bufferEndError() error {
 	if b.fixed {
 		return b.SetError(ErrUnexpectedEOB)
-	} else {
-		return b.SetError(ErrNoMoreBytes)
 	}
+	return b.SetError(ErrNoMoreBytes)
 }
 
 // SetError marks a buffer as failed. Append and parse operations will fail with
@@ -335,7 +337,7 @@ func (b *Buffer) Collect(count int) ([]byte, error) {
 	return data, nil
 }
 
-// CollectWithDelimiter collects count bytes and checks delim will immediately
+// CollectWithSuffix collects count bytes and checks delim will immediately
 // follow the byte sequence. Returns count bytes without delim.
 // If delim is not matched ErrExpectedByteSequenceMismatch will be raised.
 func (b *Buffer) CollectWithSuffix(count int, delim []byte) ([]byte, error) {
@@ -386,11 +388,25 @@ func (b *Buffer) IndexByte(byte byte) int {
 		return -1
 	}
 
-	idx := bytes.IndexByte(b.data[b.mark:], byte)
+	idx := bytes.IndexByte(b.data[b.offset:], byte)
 	if idx < 0 {
 		return -1
 	}
-	return idx + b.mark
+	return idx + (b.offset - b.mark)
+}
+
+// IndexByteFrom returns offset of byte in unpressed buffer starting at off.
+// Returns -1 if byte not in buffer
+func (b *Buffer) IndexByteFrom(off int, byte byte) int {
+	if b.err != nil {
+		return -1
+	}
+
+	idx := bytes.IndexByte(b.data[b.offset+off:], byte)
+	if idx < 0 {
+		return -1
+	}
+	return idx + (b.offset - b.mark) + off
 }
 
 // CollectUntil collects all bytes until delim was found (including delim).
@@ -426,4 +442,40 @@ func (b *Buffer) CollectUntilByte(delim byte) ([]byte, error) {
 	data := b.data[b.mark:end]
 	b.Advance(len(data))
 	return data, nil
+}
+
+// CollectWhile collects all bytes until predicate returns false
+func (b *Buffer) CollectWhile(pred func(byte) bool) ([]byte, error) {
+	if b.err != nil {
+		return nil, b.err
+	}
+
+	data := b.data[b.offset:]
+	for i, byte := range data {
+		if !pred(byte) {
+			end := b.offset + i + 1
+			data := b.data[b.mark:end]
+			b.Advance(len(data))
+			return data, nil
+		}
+	}
+
+	b.offset = b.mark + b.available
+	return nil, b.bufferEndError()
+}
+
+func (b *Buffer) PeekByte() (byte, error) {
+	return b.PeekByteFrom(0)
+}
+
+func (b *Buffer) PeekByteFrom(off int) (byte, error) {
+	if b.err != nil {
+		return 0, b.err
+	}
+
+	if !b.Avail(off + 1) {
+		return 0, b.bufferEndError()
+	}
+
+	return b.data[b.mark+off], nil
 }

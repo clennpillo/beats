@@ -8,23 +8,43 @@ import (
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
 	"github.com/elastic/beats/libbeat/publisher"
+	"github.com/nranchev/go-libGeoIP"
 )
 
 type Transactions interface {
 	PublishTransaction(common.MapStr) bool
 }
 
+type Flows interface {
+	PublishFlows([]common.MapStr) bool
+}
+
 type PacketbeatPublisher struct {
-	pub    *publisher.PublisherType
+	pub    publisher.Publisher
 	client publisher.Client
 
-	wg     sync.WaitGroup
-	events chan common.MapStr
-	done   chan struct{}
+	topo           topologyProvider
+	geoLite        *libgeo.GeoIP
+	ignoreOutgoing bool
+
+	wg   sync.WaitGroup
+	done chan struct{}
+
+	trans chan common.MapStr
+	flows chan []common.MapStr
 }
 
 type ChanTransactions struct {
 	Channel chan common.MapStr
+}
+
+// XXX: currently implemented by libbeat publisher. This functionality is only
+// required by packetbeat. Source for TopologyProvider should become local to
+// packetbeat.
+type topologyProvider interface {
+	IsPublisherIP(ip string) bool
+	GetServerName(ip string) string
+	GeoLite() *libgeo.GeoIP
 }
 
 func (t *ChanTransactions) PublishTransaction(event common.MapStr) bool {
@@ -34,58 +54,111 @@ func (t *ChanTransactions) PublishTransaction(event common.MapStr) bool {
 
 var debugf = logp.MakeDebug("publish")
 
-func NewPublisher(pub *publisher.PublisherType, hwm int) *PacketbeatPublisher {
-	return &PacketbeatPublisher{
-		pub:    pub,
-		client: pub.Client(),
-		done:   make(chan struct{}),
-		events: make(chan common.MapStr, hwm),
+func NewPublisher(
+	pub publisher.Publisher,
+	hwm, bulkHWM int,
+	ignoreOutgoing bool,
+) (*PacketbeatPublisher, error) {
+	topo, ok := pub.(topologyProvider)
+	if !ok {
+		return nil, errors.New("Requires topology provider")
 	}
+
+	return &PacketbeatPublisher{
+		pub:            pub,
+		topo:           topo,
+		geoLite:        topo.GeoLite(),
+		ignoreOutgoing: ignoreOutgoing,
+		client:         pub.Connect(),
+		done:           make(chan struct{}),
+		trans:          make(chan common.MapStr, hwm),
+		flows:          make(chan []common.MapStr, bulkHWM),
+	}, nil
 }
 
-func (t *PacketbeatPublisher) PublishTransaction(event common.MapStr) bool {
+func (p *PacketbeatPublisher) PublishTransaction(event common.MapStr) bool {
 	select {
-	case t.events <- event:
+	case p.trans <- event:
 		return true
 	default:
+		// drop event if queue is full
 		return false
 	}
 }
 
-func (t *PacketbeatPublisher) Start() {
-	t.wg.Add(1)
-	go func() {
-		defer t.wg.Done()
+func (p *PacketbeatPublisher) PublishFlows(event []common.MapStr) bool {
+	select {
+	case p.flows <- event:
+		return true
+	case <-p.done:
+		// drop event, if worker has been stopped
+		return false
+	}
+}
 
+func (p *PacketbeatPublisher) Start() {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
 		for {
 			select {
-			case event := <-t.events:
-				t.onEvent(event)
-			case <-t.done:
+			case <-p.done:
 				return
+			case event := <-p.trans:
+				p.onTransaction(event)
+			}
+		}
+	}()
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		for {
+			select {
+			case <-p.done:
+				return
+			case events := <-p.flows:
+				p.onFlow(events)
 			}
 		}
 	}()
 }
 
-func (t *PacketbeatPublisher) Stop() {
-	close(t.done)
-	t.wg.Wait()
+func (p *PacketbeatPublisher) Stop() {
+	p.client.Close()
+	close(p.done)
+	p.wg.Wait()
 }
 
-func (t *PacketbeatPublisher) onEvent(event common.MapStr) {
+func (p *PacketbeatPublisher) onTransaction(event common.MapStr) {
 	if err := validateEvent(event); err != nil {
 		logp.Warn("Dropping invalid event: %v", err)
 		return
 	}
 
-	debugf("on event")
-
-	if !updateEventAddresses(t.pub, event) {
+	if !p.normalizeTransAddr(event) {
 		return
 	}
 
-	t.client.PublishEvent(event)
+	p.client.PublishEvent(event)
+}
+
+func (p *PacketbeatPublisher) onFlow(events []common.MapStr) {
+	pub := events[:0]
+	for _, event := range events {
+		if err := validateEvent(event); err != nil {
+			logp.Warn("Dropping invalid event: %v", err)
+			continue
+		}
+
+		if !p.addGeoIPToFlow(event) {
+			continue
+		}
+
+		pub = append(pub, event)
+	}
+
+	p.client.PublishEvents(pub)
 }
 
 // filterEvent validates an event for common required fields with types.
@@ -101,11 +174,6 @@ func validateEvent(event common.MapStr) error {
 		return errors.New("invalid '@timestamp' field from event")
 	}
 
-	err := event.EnsureCountField()
-	if err != nil {
-		return err
-	}
-
 	t, ok := event["type"]
 	if !ok {
 		return errors.New("missing 'type' field from event")
@@ -119,15 +187,17 @@ func validateEvent(event common.MapStr) error {
 	return nil
 }
 
-func updateEventAddresses(pub *publisher.PublisherType, event common.MapStr) bool {
+func (p *PacketbeatPublisher) normalizeTransAddr(event common.MapStr) bool {
+	debugf("normalize address for: %v", event)
+
 	var srcServer, dstServer string
 	src, ok := event["src"].(*common.Endpoint)
-
+	debugf("has src: %v", ok)
 	if ok {
 		// check if it's outgoing transaction (as client)
-		isOutgoing := pub.IsPublisherIP(src.Ip)
+		isOutgoing := p.topo.IsPublisherIP(src.IP)
 		if isOutgoing {
-			if pub.IgnoreOutgoing {
+			if p.ignoreOutgoing {
 				// duplicated transaction -> ignore it
 				debugf("Ignore duplicated transaction on: %s -> %s", srcServer, dstServer)
 				return false
@@ -137,8 +207,8 @@ func updateEventAddresses(pub *publisher.PublisherType, event common.MapStr) boo
 			event["direction"] = "out"
 		}
 
-		srcServer = pub.GetServerName(src.Ip)
-		event["client_ip"] = src.Ip
+		srcServer = p.topo.GetServerName(src.IP)
+		event["client_ip"] = src.IP
 		event["client_port"] = src.Port
 		event["client_proc"] = src.Proc
 		event["client_server"] = srcServer
@@ -146,35 +216,34 @@ func updateEventAddresses(pub *publisher.PublisherType, event common.MapStr) boo
 	}
 
 	dst, ok := event["dst"].(*common.Endpoint)
+	debugf("has dst: %v", ok)
 	if ok {
-		dstServer = pub.GetServerName(dst.Ip)
-		event["ip"] = dst.Ip
+		dstServer = p.topo.GetServerName(dst.IP)
+		event["ip"] = dst.IP
 		event["port"] = dst.Port
 		event["proc"] = dst.Proc
 		event["server"] = dstServer
 		delete(event, "dst")
 
 		//check if it's incoming transaction (as server)
-		if pub.IsPublisherIP(dst.Ip) {
+		if p.topo.IsPublisherIP(dst.IP) {
 			// incoming transaction
 			event["direction"] = "in"
 		}
 
 	}
 
-	event.EnsureCountField()
-
-	if pub.GeoLite != nil {
+	if p.geoLite != nil {
 		realIP, exists := event["real_ip"]
 		if exists && len(realIP.(common.NetString)) > 0 {
-			loc := pub.GeoLite.GetLocationByIP(string(realIP.(common.NetString)))
+			loc := p.geoLite.GetLocationByIP(string(realIP.(common.NetString)))
 			if loc != nil && loc.Latitude != 0 && loc.Longitude != 0 {
 				loc := fmt.Sprintf("%f, %f", loc.Latitude, loc.Longitude)
 				event["client_location"] = loc
 			}
 		} else {
 			if len(srcServer) == 0 && src != nil { // only for external IP addresses
-				loc := pub.GeoLite.GetLocationByIP(src.Ip)
+				loc := p.geoLite.GetLocationByIP(src.IP)
 				if loc != nil && loc.Latitude != 0 && loc.Longitude != 0 {
 					loc := fmt.Sprintf("%f, %f", loc.Latitude, loc.Longitude)
 					event["client_location"] = loc
@@ -182,6 +251,60 @@ func updateEventAddresses(pub *publisher.PublisherType, event common.MapStr) boo
 			}
 		}
 	}
+
+	return true
+}
+
+func (p *PacketbeatPublisher) addGeoIPToFlow(event common.MapStr) bool {
+
+	getLocation := func(host common.MapStr, ip_type string) string {
+
+		ip, exists := host[ip_type]
+		if !exists {
+			return ""
+		}
+
+		str, ok := ip.(string)
+		if !ok {
+			logp.Warn("IP address must be string")
+			return ""
+		}
+		loc := p.geoLite.GetLocationByIP(str)
+		if loc == nil || loc.Latitude == 0 || loc.Longitude == 0 {
+			return ""
+		}
+
+		return fmt.Sprintf("%f, %f", loc.Latitude, loc.Longitude)
+	}
+
+	if p.geoLite == nil {
+		return true
+	}
+
+	ipFieldNames := [][]string{
+		{"ip", "ip_location"},
+		{"outter_ip", "outter_ip_location"},
+		{"ipv6", "ipv6_location"},
+		{"outter_ipv6", "outter_ipv6_location"},
+	}
+
+	source := event["source"].(common.MapStr)
+	dest := event["dest"].(common.MapStr)
+
+	for _, name := range ipFieldNames {
+
+		loc := getLocation(source, name[0])
+		if loc != "" {
+			source[name[1]] = loc
+		}
+
+		loc = getLocation(dest, name[0])
+		if loc != "" {
+			dest[name[1]] = loc
+		}
+	}
+	event["source"] = source
+	event["dest"] = dest
 
 	return true
 }

@@ -11,4 +11,11 @@ forum].
 
 The index template might not be loaded correctly. See <<winlogbeat-template>>.
 
+[float]
+[[bogus-computer-name-fields]]
+=== Bogus computer_name fields are reported in some events?
+
+Prior to the hostname configuration stage, during OS installation any event log
+records generated may have a randomly assigned hostname.
+
 include::../../libbeat/docs/shared-faq.asciidoc[]

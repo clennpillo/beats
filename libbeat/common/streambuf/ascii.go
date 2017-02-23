@@ -45,7 +45,7 @@ func (b *Buffer) UntilCRLF() ([]byte, error) {
 	return nil, b.bufferEndError()
 }
 
-// Ignore symbol will advance the read pointer until the first symbol not
+// IgnoreSymbol will advance the read pointer until the first symbol not
 // matching s is found.
 func (b *Buffer) IgnoreSymbol(s uint8) error {
 	if b.err != nil {
@@ -58,6 +58,30 @@ func (b *Buffer) IgnoreSymbol(s uint8) error {
 			b.Advance(b.offset + i - b.mark)
 			return nil
 		}
+	}
+	b.offset += len(data)
+	return b.bufferEndError()
+}
+
+// IgnoreSymbols will advance the read pointer until the first symbol not matching
+// set of symbols is found
+func (b *Buffer) IgnoreSymbols(syms []byte) error {
+	if b.err != nil {
+		return b.err
+	}
+
+	data := b.data[b.offset:]
+	for i, byte := range data {
+		for _, other := range syms {
+			if byte == other {
+				goto next
+			}
+		}
+		// no match
+		b.Advance(b.offset + i - b.mark)
+		return nil
+
+	next:
 	}
 	b.offset += len(data)
 	return b.bufferEndError()
@@ -83,15 +107,15 @@ func (b *Buffer) UntilSymbol(s uint8, errOnEnd bool) ([]byte, error) {
 	if errOnEnd {
 		b.offset += len(data)
 		return nil, b.bufferEndError()
-	} else {
-		data := b.data[b.mark:]
-		b.Advance(len(data))
-		return data, nil
 	}
+
+	data = b.data[b.mark:]
+	b.Advance(len(data))
+	return data, nil
 }
 
-// AsciiUint will parse unsigned number from Buffer.
-func (b *Buffer) AsciiUint(errOnEnd bool) (uint64, error) {
+// UintASCII will parse unsigned number from Buffer.
+func (b *Buffer) UintASCII(errOnEnd bool) (uint64, error) {
 	if b.err != nil {
 		return 0, b.err
 	}
@@ -113,8 +137,8 @@ func (b *Buffer) AsciiUint(errOnEnd bool) (uint64, error) {
 	return value, nil
 }
 
-// AsciiInt will parse (optionally) signed number from Buffer.
-func (b *Buffer) AsciiInt(errOnEnd bool) (int64, error) {
+// IntASCII will parse (optionally) signed number from Buffer.
+func (b *Buffer) IntASCII(errOnEnd bool) (int64, error) {
 	if b.err != nil {
 		return 0, b.err
 	}
@@ -156,14 +180,13 @@ func (b *Buffer) AsciiInt(errOnEnd bool) (int64, error) {
 	b.Advance(end - b.mark)
 	if signed {
 		return -int64(value), nil
-	} else {
-		return int64(value), nil
 	}
+	return int64(value), nil
 }
 
-// AsciiMatch checks the Buffer it's next byte sequence matched prefix. The
+// MatchASCII checks the Buffer it's next byte sequence matched prefix. The
 // read pointer is not advanced by AsciiPrefix.
-func (b *Buffer) AsciiMatch(prefix []byte) (bool, error) {
+func (b *Buffer) MatchASCII(prefix []byte) (bool, error) {
 	if b.err != nil {
 		return false, b.err
 	}
@@ -189,9 +212,8 @@ func (b *Buffer) asciiFindNumberEnd(start int, errOnEnd bool) (int, error) {
 	if end < 0 {
 		if errOnEnd {
 			return -1, b.bufferEndError()
-		} else {
-			end = len(b.data)
 		}
+		end = len(b.data)
 	}
 
 	return end, nil

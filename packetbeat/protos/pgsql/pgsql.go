@@ -1,100 +1,28 @@
 package pgsql
 
 import (
+	"errors"
+	"expvar"
 	"strings"
 	"time"
 
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
 
-	"github.com/elastic/beats/packetbeat/config"
 	"github.com/elastic/beats/packetbeat/procs"
 	"github.com/elastic/beats/packetbeat/protos"
 	"github.com/elastic/beats/packetbeat/protos/tcp"
 	"github.com/elastic/beats/packetbeat/publish"
 )
 
-type PgsqlMessage struct {
-	start         int
-	end           int
-	isSSLResponse bool
-	isSSLRequest  bool
-	toExport      bool
-
-	Ts             time.Time
-	IsRequest      bool
-	Query          string
-	Size           uint64
-	Fields         []string
-	FieldsFormat   []byte
-	Rows           [][]string
-	NumberOfRows   int
-	NumberOfFields int
-	IsOK           bool
-	IsError        bool
-	ErrorInfo      string
-	ErrorCode      string
-	ErrorSeverity  string
-	Notes          []string
-
-	Direction    uint8
-	TcpTuple     common.TcpTuple
-	CmdlineTuple *common.CmdlineTuple
-}
-
-type PgsqlTransaction struct {
-	Type         string
-	tuple        common.TcpTuple
-	Src          common.Endpoint
-	Dst          common.Endpoint
-	ResponseTime int32
-	Ts           int64
-	JsTs         time.Time
-	ts           time.Time
-	Query        string
-	Method       string
-	BytesOut     uint64
-	BytesIn      uint64
-	Notes        []string
-
-	Pgsql common.MapStr
-
-	Request_raw  string
-	Response_raw string
-}
-
-type PgsqlStream struct {
-	tcptuple *common.TcpTuple
-
-	data []byte
-
-	parseOffset       int
-	parseState        int
-	seenSSLRequest    bool
-	expectSSLResponse bool
-
-	message *PgsqlMessage
-}
-
-const (
-	PgsqlStartState = iota
-	PgsqlGetDataState
-)
-
-const (
-	SSLRequest = iota
-	StartupMessage
-	CancelRequest
-)
-
-type Pgsql struct {
+type pgsqlPlugin struct {
 
 	// config
-	Ports         []int
-	maxStoreRows  int
-	maxRowLength  int
-	Send_request  bool
-	Send_response bool
+	ports        []int
+	maxStoreRows int
+	maxRowLength int
+	sendRequest  bool
+	sendResponse bool
 
 	transactions       *common.Cache
 	transactionTimeout time.Duration
@@ -102,61 +30,117 @@ type Pgsql struct {
 	results publish.Transactions
 
 	// function pointer for mocking
-	handlePgsql func(pgsql *Pgsql, m *PgsqlMessage, tcp *common.TcpTuple,
+	handlePgsql func(pgsql *pgsqlPlugin, m *pgsqlMessage, tcp *common.TCPTuple,
 		dir uint8, raw_msg []byte)
 }
 
-func (pgsql *Pgsql) getTransaction(k common.HashableTcpTuple) []*PgsqlTransaction {
-	v := pgsql.transactions.Get(k)
-	if v != nil {
-		return v.([]*PgsqlTransaction)
-	}
-	return nil
+type pgsqlMessage struct {
+	start         int
+	end           int
+	isSSLResponse bool
+	isSSLRequest  bool
+	toExport      bool
+
+	ts             time.Time
+	isRequest      bool
+	query          string
+	size           uint64
+	fields         []string
+	fieldsFormat   []byte
+	rows           [][]string
+	numberOfRows   int
+	numberOfFields int
+	isOK           bool
+	isError        bool
+	errorInfo      string
+	errorCode      string
+	errorSeverity  string
+	notes          []string
+
+	direction    uint8
+	tcpTuple     common.TCPTuple
+	cmdlineTuple *common.CmdlineTuple
 }
 
-func (pgsql *Pgsql) InitDefaults() {
-	pgsql.maxRowLength = 1024
-	pgsql.maxStoreRows = 10
-	pgsql.Send_request = false
-	pgsql.Send_response = false
-	pgsql.transactionTimeout = protos.DefaultTransactionExpiration
+type pgsqlTransaction struct {
+	tuple        common.TCPTuple
+	src          common.Endpoint
+	dst          common.Endpoint
+	responseTime int32
+	ts           time.Time
+	query        string
+	method       string
+	bytesOut     uint64
+	bytesIn      uint64
+	notes        []string
+
+	pgsql common.MapStr
+
+	requestRaw  string
+	responseRaw string
 }
 
-func (pgsql *Pgsql) setFromConfig(config config.Pgsql) error {
+type pgsqlStream struct {
+	data []byte
 
-	pgsql.Ports = config.Ports
+	parseOffset       int
+	parseState        int
+	seenSSLRequest    bool
+	expectSSLResponse bool
 
-	if config.Max_row_length != nil {
-		pgsql.maxRowLength = *config.Max_row_length
-	}
-	if config.Max_rows != nil {
-		pgsql.maxStoreRows = *config.Max_rows
-	}
-	if config.SendRequest != nil {
-		pgsql.Send_request = *config.SendRequest
-	}
-	if config.SendResponse != nil {
-		pgsql.Send_response = *config.SendResponse
-	}
-	if config.TransactionTimeout != nil && *config.TransactionTimeout > 0 {
-		pgsql.transactionTimeout = time.Duration(*config.TransactionTimeout) * time.Second
-	}
-	return nil
+	message *pgsqlMessage
 }
 
-func (pgsql *Pgsql) GetPorts() []int {
-	return pgsql.Ports
+const (
+	pgsqlStartState = iota
+	pgsqlGetDataState
+	pgsqlExtendedQueryState
+)
+
+const (
+	sslRequest = iota
+	startupMessage
+	cancelRequest
+)
+
+var (
+	errInvalidLength = errors.New("invalid length")
+)
+
+var (
+	debugf    = logp.MakeDebug("pgsql")
+	detailedf = logp.MakeDebug("pgsqldetailed")
+)
+
+var (
+	unmatchedResponses = expvar.NewInt("pgsql.unmatched_responses")
+)
+
+func init() {
+	protos.Register("pgsql", New)
 }
 
-func (pgsql *Pgsql) Init(test_mode bool, results publish.Transactions) error {
-
-	pgsql.InitDefaults()
-	if !test_mode {
-		err := pgsql.setFromConfig(config.ConfigSingleton.Protocols.Pgsql)
-		if err != nil {
-			return err
+func New(
+	testMode bool,
+	results publish.Transactions,
+	cfg *common.Config,
+) (protos.Plugin, error) {
+	p := &pgsqlPlugin{}
+	config := defaultConfig
+	if !testMode {
+		if err := cfg.Unpack(&config); err != nil {
+			return nil, err
 		}
 	}
+
+	if err := p.init(results, &config); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (pgsql *pgsqlPlugin) init(results publish.Transactions, config *pgsqlConfig) error {
+	pgsql.setFromConfig(config)
 
 	pgsql.transactions = common.NewCache(
 		pgsql.transactionTimeout,
@@ -168,26 +152,32 @@ func (pgsql *Pgsql) Init(test_mode bool, results publish.Transactions) error {
 	return nil
 }
 
-func (stream *PgsqlStream) PrepareForNewMessage() {
-	stream.data = stream.data[stream.message.end:]
-	stream.parseState = PgsqlStartState
-	stream.parseOffset = 0
-	stream.message = nil
+func (pgsql *pgsqlPlugin) setFromConfig(config *pgsqlConfig) {
+	pgsql.ports = config.Ports
+	pgsql.maxRowLength = config.MaxRowLength
+	pgsql.maxStoreRows = config.MaxRows
+	pgsql.sendRequest = config.SendRequest
+	pgsql.sendResponse = config.SendResponse
+	pgsql.transactionTimeout = config.TransactionTimeout
 }
 
-// Parse a list of commands separated by semicolon from the query
-func pgsqlQueryParser(query string) []string {
-	array := strings.Split(query, ";")
-
-	queries := []string{}
-
-	for _, q := range array {
-		qt := strings.TrimSpace(q)
-		if len(qt) > 0 {
-			queries = append(queries, qt)
-		}
+func (pgsql *pgsqlPlugin) getTransaction(k common.HashableTCPTuple) []*pgsqlTransaction {
+	v := pgsql.transactions.Get(k)
+	if v != nil {
+		return v.([]*pgsqlTransaction)
 	}
-	return queries
+	return nil
+}
+
+func (pgsql *pgsqlPlugin) GetPorts() []int {
+	return pgsql.ports
+}
+
+func (stream *pgsqlStream) prepareForNewMessage() {
+	stream.data = stream.data[stream.message.end:]
+	stream.parseState = pgsqlStartState
+	stream.parseOffset = 0
+	stream.message = nil
 }
 
 // Extract the method from a SQL query
@@ -203,464 +193,15 @@ func getQueryMethod(q string) string {
 	return method
 }
 
-func pgsqlFieldsParser(s *PgsqlStream) {
-	m := s.message
-
-	// read field count (int16)
-	field_count := int(common.Bytes_Ntohs(s.data[s.parseOffset : s.parseOffset+2]))
-	s.parseOffset += 2
-	logp.Debug("pgsqldetailed", "Row Description field count=%d", field_count)
-
-	fields := []string{}
-	fields_format := []byte{}
-
-	for i := 0; i < field_count; i++ {
-		// read field name (null terminated string)
-		field_name, err := common.ReadString(s.data[s.parseOffset:])
-		if err != nil {
-			logp.Err("Fail to read the column field")
-		}
-		fields = append(fields, field_name)
-		m.NumberOfFields += 1
-		s.parseOffset += len(field_name) + 1
-
-		// read Table OID (int32)
-		s.parseOffset += 4
-
-		// read Column Index (int16)
-		s.parseOffset += 2
-
-		// read Type OID (int32)
-		s.parseOffset += 4
-
-		// read column length (int16)
-		s.parseOffset += 2
-
-		// read type modifier (int32)
-		s.parseOffset += 4
-
-		// read format (int16)
-		format := common.Bytes_Ntohs(s.data[s.parseOffset : s.parseOffset+2])
-		fields_format = append(fields_format, byte(format))
-		s.parseOffset += 2
-
-		logp.Debug("pgsqldetailed", "Field name=%s, format=%d", field_name, format)
-	}
-	m.Fields = fields
-	m.FieldsFormat = fields_format
-	if m.NumberOfFields != field_count {
-		logp.Err("Missing fields from RowDescription. Expected %d. Received %d", field_count, m.NumberOfFields)
-	}
-}
-
-func (pgsql *Pgsql) pgsqlRowsParser(s *PgsqlStream) {
-	m := s.message
-
-	// read field count (int16)
-	field_count := int(common.Bytes_Ntohs(s.data[s.parseOffset : s.parseOffset+2]))
-	s.parseOffset += 2
-	logp.Debug("pgsqldetailed", "DataRow field count=%d", field_count)
-
-	row := []string{}
-	var row_len int
-
-	for i := 0; i < field_count; i++ {
-
-		// read column length (int32)
-		column_length := int32(common.Bytes_Ntohl(s.data[s.parseOffset : s.parseOffset+4]))
-		s.parseOffset += 4
-
-		// read column value (byten)
-		column_value := []byte{}
-
-		if m.FieldsFormat[i] == 0 {
-			// field value in text format
-			if column_length > 0 {
-				column_value = s.data[s.parseOffset : s.parseOffset+int(column_length)]
-			} else if column_length == -1 {
-				column_value = nil
-			}
-		}
-
-		if row_len < pgsql.maxRowLength {
-			if row_len+len(column_value) > pgsql.maxRowLength {
-				column_value = column_value[:pgsql.maxRowLength-row_len]
-			}
-			row = append(row, string(column_value))
-			row_len += len(column_value)
-		}
-
-		if column_length > 0 {
-			s.parseOffset += int(column_length)
-		}
-
-		logp.Debug("pgsqldetailed", "Value %s, length=%d", string(column_value), column_length)
-
-	}
-	m.NumberOfRows += 1
-	if len(m.Rows) < pgsql.maxStoreRows {
-		m.Rows = append(m.Rows, row)
-	}
-}
-
-func pgsqlErrorParser(s *PgsqlStream) {
-
-	m := s.message
-
-	for len(s.data[s.parseOffset:]) > 0 {
-		// read field type(byte1)
-		field_type := s.data[s.parseOffset]
-		s.parseOffset += 1
-
-		if field_type == 0 {
-			break
-		}
-
-		// read field value(string)
-		field_value, err := common.ReadString(s.data[s.parseOffset:])
-		if err != nil {
-			logp.Err("Fail to read the column field")
-		}
-		s.parseOffset += len(field_value) + 1
-
-		if field_type == 'M' {
-			m.ErrorInfo = field_value
-		} else if field_type == 'C' {
-			m.ErrorCode = field_value
-		} else if field_type == 'S' {
-			m.ErrorSeverity = field_value
-		}
-
-	}
-	logp.Debug("pgsqldetailed", "%s %s %s", m.ErrorSeverity, m.ErrorCode, m.ErrorInfo)
-}
-
-func isSpecialPgsqlCommand(data []byte) (bool, int) {
-
-	if len(data) < 8 {
-		// 8 bytes required
-		return false, 0
-	}
-
-	// read length
-	length := int(common.Bytes_Ntohl(data[0:4]))
-
-	// read command identifier
-	code := int(common.Bytes_Ntohl(data[4:8]))
-
-	if length == 16 && code == 80877102 {
-		// Cancel Request
-		logp.Debug("pgsqldetailed", "Cancel Request, length=%d", length)
-		return true, CancelRequest
-	} else if length == 8 && code == 80877103 {
-		// SSL Request
-		logp.Debug("pgsqldetailed", "SSL Request, length=%d", length)
-		return true, SSLRequest
-	} else if code == 196608 {
-		// Startup Message
-		logp.Debug("pgsqldetailed", "Startup Message, length=%d", length)
-		return true, StartupMessage
-	}
-	return false, 0
-}
-
-func (pgsql *Pgsql) pgsqlMessageParser(s *PgsqlStream) (bool, bool) {
-
-	m := s.message
-	for s.parseOffset < len(s.data) {
-		switch s.parseState {
-		case PgsqlStartState:
-			if len(s.data[s.parseOffset:]) < 5 {
-				logp.Warn("Postgresql Message too short. %X (length=%d). Wait for more.", s.data[s.parseOffset:], len(s.data[s.parseOffset:]))
-				return true, false
-			}
-
-			is_special, command := isSpecialPgsqlCommand(s.data[s.parseOffset:])
-
-			if is_special {
-				// In case of Commands: StartupMessage, SSLRequest, CancelRequest that don't have
-				// their type in the first byte
-
-				// read length
-				length := int(common.Bytes_Ntohl(s.data[s.parseOffset : s.parseOffset+4]))
-
-				// ignore command
-				if len(s.data[s.parseOffset:]) >= length {
-
-					if command == SSLRequest {
-						// if SSLRequest is received, expect for one byte reply (S or N)
-						m.start = s.parseOffset
-						s.parseOffset += length
-						m.end = s.parseOffset
-						m.isSSLRequest = true
-						m.Size = uint64(m.end - m.start)
-
-						return true, true
-					}
-					s.parseOffset += length
-				} else {
-					// wait for more
-					logp.Debug("pgsqldetailed", "Wait for more data 1")
-					return true, false
-				}
-
-			} else {
-				// In case of Commands that have their type in the first byte
-
-				// read type
-				typ := byte(s.data[s.parseOffset])
-
-				if s.expectSSLResponse {
-					// SSLRequest was received in the other stream
-					if typ == 'N' || typ == 'S' {
-						// one byte reply to SSLRequest
-						logp.Debug("pgsqldetailed", "Reply for SSLRequest %c", typ)
-						m.start = s.parseOffset
-						s.parseOffset += 1
-						m.end = s.parseOffset
-						m.isSSLResponse = true
-						m.Size = uint64(m.end - m.start)
-
-						return true, true
-					}
-				}
-
-				// read length
-				length := int(common.Bytes_Ntohl(s.data[s.parseOffset+1 : s.parseOffset+5]))
-
-				if length < 4 {
-					// length should include the size of itself (int32)
-					logp.Debug("pgsqldetailed", "Invalid pgsql command length.")
-					return false, false
-				}
-
-				logp.Debug("pgsqldetailed", "Pgsql type %c, length=%d", typ, length)
-
-				if typ == 'Q' {
-					// SimpleQuery
-					m.start = s.parseOffset
-					m.IsRequest = true
-
-					if len(s.data[s.parseOffset:]) >= length+1 {
-						s.parseOffset += 1 //type
-						s.parseOffset += length
-						m.end = s.parseOffset
-						m.Size = uint64(m.end - m.start)
-
-						m.Query = string(s.data[m.start+5 : m.end-1]) //without string termination
-
-						m.toExport = true
-						logp.Debug("pgsqldetailed", "Simple Query: %s", m.Query)
-						return true, true
-					} else {
-						// wait for more
-						logp.Debug("pgsqldetailed", "Wait for more data 2")
-						return true, false
-					}
-				} else if typ == 'T' {
-					// RowDescription
-
-					m.start = s.parseOffset
-					m.IsRequest = false
-					m.IsOK = true
-					m.toExport = true
-
-					if len(s.data[s.parseOffset:]) >= length+1 {
-						s.parseOffset += 1 //type
-						s.parseOffset += 4 //length
-
-						pgsqlFieldsParser(s)
-						logp.Debug("pgsqldetailed", "Fields: %s", m.Fields)
-
-						s.parseState = PgsqlGetDataState
-					} else {
-						// wait for more
-						logp.Debug("pgsqldetailed", "Wait for more data 3")
-						return true, false
-					}
-
-				} else if typ == 'I' {
-					// EmptyQueryResponse, appears as a response for empty queries
-					// substitutes CommandComplete
-
-					logp.Debug("pgsqldetailed", "EmptyQueryResponse")
-					m.start = s.parseOffset
-					m.IsOK = true
-					m.IsRequest = false
-					m.toExport = true
-					s.parseOffset += 5 // type + length
-					m.end = s.parseOffset
-					m.Size = uint64(m.end - m.start)
-
-					return true, true
-
-				} else if typ == 'E' {
-					// ErrorResponse
-
-					logp.Debug("pgsqldetailed", "ErrorResponse")
-					m.start = s.parseOffset
-					m.IsRequest = false
-					m.IsError = true
-					m.toExport = true
-
-					if len(s.data[s.parseOffset:]) >= length+1 {
-						s.parseOffset += 1 //type
-						s.parseOffset += 4 //length
-
-						pgsqlErrorParser(s)
-
-						m.end = s.parseOffset
-						m.Size = uint64(m.end - m.start)
-
-						return true, true
-					} else {
-						// wait for more
-						logp.Debug("pgsqldetailed", "Wait for more data 4")
-						return true, false
-					}
-				} else if typ == 'C' {
-					// CommandComplete -> Successful response
-
-					m.start = s.parseOffset
-					m.IsRequest = false
-					m.IsOK = true
-					m.toExport = true
-
-					if len(s.data[s.parseOffset:]) >= length+1 {
-						s.parseOffset += 1 //type
-
-						name := string(s.data[s.parseOffset+4 : s.parseOffset+length-1]) //without \0
-						logp.Debug("pgsqldetailed", "CommandComplete length=%d, tag=%s", length, name)
-
-						s.parseOffset += length
-						m.end = s.parseOffset
-						m.Size = uint64(m.end - m.start)
-
-						return true, true
-					} else {
-						// wait for more
-						logp.Debug("pgsqldetailed", "Wait for more data 5")
-						return true, false
-					}
-				} else if typ == 'Z' {
-					// ReadyForQuery -> backend ready for a new query cycle
-					if len(s.data[s.parseOffset:]) >= length+1 {
-						m.start = s.parseOffset
-						s.parseOffset += 1 // type
-						s.parseOffset += length
-						m.end = s.parseOffset
-						m.Size = uint64(m.end - m.start)
-
-						return true, true
-					} else {
-						// wait for more
-						logp.Debug("pgsqldetailed", "Wait for more 5b")
-						return true, false
-					}
-				} else {
-					// TODO: add info from NoticeResponse in case there are warning messages for a query
-					// ignore command
-					if len(s.data[s.parseOffset:]) >= length+1 {
-						s.parseOffset += 1 //type
-						s.parseOffset += length
-						m.end = s.parseOffset
-						m.Size = uint64(m.end - m.start)
-
-						// ok and complete, but ignore
-						m.toExport = false
-						return true, true
-					} else {
-						// wait for more
-						logp.Debug("pgsqldetailed", "Wait for more data 6")
-						return true, false
-					}
-				}
-			}
-
-			break
-
-		case PgsqlGetDataState:
-
-			// The response to queries that return row sets contains:
-			// RowDescription
-			// zero or more DataRow
-			// CommandComplete
-			// ReadyForQuery
-
-			if len(s.data[s.parseOffset:]) < 5 {
-				logp.Warn("Postgresql Message too short (length=%d). Wait for more.", len(s.data[s.parseOffset:]))
-				return true, false
-			}
-
-			// read type
-			typ := byte(s.data[s.parseOffset])
-
-			// read message length
-			length := int(common.Bytes_Ntohl(s.data[s.parseOffset+1 : s.parseOffset+5]))
-
-			if typ == 'D' {
-				// DataRow
-
-				if len(s.data[s.parseOffset:]) >= length+1 {
-					// skip type
-					s.parseOffset += 1
-					// skip length size
-					s.parseOffset += 4
-
-					pgsql.pgsqlRowsParser(s)
-
-				} else {
-					// wait for more
-					logp.Debug("pgsqldetailed", "Wait for more data 7")
-					return true, false
-				}
-
-			} else if typ == 'C' {
-				// CommandComplete
-
-				if len(s.data[s.parseOffset:]) >= length+1 {
-
-					// skip type
-					s.parseOffset += 1
-
-					name := string(s.data[s.parseOffset+4 : s.parseOffset+length-1]) //without \0
-					logp.Debug("pgsqldetailed", "CommandComplete length=%d, tag=%s", length, name)
-
-					s.parseOffset += length
-					m.end = s.parseOffset
-					m.Size = uint64(m.end - m.start)
-
-					s.parseState = PgsqlStartState
-
-					logp.Debug("pgsqldetailed", "Rows: %s", m.Rows)
-
-					return true, true
-				} else {
-					// wait for more
-					logp.Debug("pgsqldetailed", "Wait for more data 8")
-					return true, false
-				}
-			} else {
-				// shouldn't happen
-				logp.Debug("pgsqldetailed", "Skip command of type %c", typ)
-				s.parseState = PgsqlStartState
-			}
-			break
-		}
-	}
-
-	return true, false
-}
-
 type pgsqlPrivateData struct {
-	Data [2]*PgsqlStream
+	data [2]*pgsqlStream
 }
 
-func (pgsql *Pgsql) ConnectionTimeout() time.Duration {
+func (pgsql *pgsqlPlugin) ConnectionTimeout() time.Duration {
 	return pgsql.transactionTimeout
 }
 
-func (pgsql *Pgsql) Parse(pkt *protos.Packet, tcptuple *common.TcpTuple,
+func (pgsql *pgsqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
 	dir uint8, private protos.ProtocolData) protos.ProtocolData {
 
 	defer logp.Recover("ParsePgsql exception")
@@ -674,43 +215,42 @@ func (pgsql *Pgsql) Parse(pkt *protos.Packet, tcptuple *common.TcpTuple,
 		}
 	}
 
-	if priv.Data[dir] == nil {
-		priv.Data[dir] = &PgsqlStream{
-			tcptuple: tcptuple,
-			data:     pkt.Payload,
-			message:  &PgsqlMessage{Ts: pkt.Ts},
+	if priv.data[dir] == nil {
+		priv.data[dir] = &pgsqlStream{
+			data:    pkt.Payload,
+			message: &pgsqlMessage{ts: pkt.Ts},
 		}
 		logp.Debug("pgsqldetailed", "New stream created")
 	} else {
 		// concatenate bytes
-		priv.Data[dir].data = append(priv.Data[dir].data, pkt.Payload...)
-		logp.Debug("pgsqldetailed", "Len data: %d cap data: %d", len(priv.Data[dir].data), cap(priv.Data[dir].data))
-		if len(priv.Data[dir].data) > tcp.TCP_MAX_DATA_IN_STREAM {
-			logp.Debug("pgsql", "Stream data too large, dropping TCP stream")
-			priv.Data[dir] = nil
+		priv.data[dir].data = append(priv.data[dir].data, pkt.Payload...)
+		logp.Debug("pgsqldetailed", "Len data: %d cap data: %d", len(priv.data[dir].data), cap(priv.data[dir].data))
+		if len(priv.data[dir].data) > tcp.TCPMaxDataInStream {
+			debugf("Stream data too large, dropping TCP stream")
+			priv.data[dir] = nil
 			return priv
 		}
 	}
 
-	stream := priv.Data[dir]
+	stream := priv.data[dir]
 
-	if priv.Data[1-dir] != nil && priv.Data[1-dir].seenSSLRequest {
+	if priv.data[1-dir] != nil && priv.data[1-dir].seenSSLRequest {
 		stream.expectSSLResponse = true
 	}
 
 	for len(stream.data) > 0 {
 
 		if stream.message == nil {
-			stream.message = &PgsqlMessage{Ts: pkt.Ts}
+			stream.message = &pgsqlMessage{ts: pkt.Ts}
 		}
 
-		ok, complete := pgsql.pgsqlMessageParser(priv.Data[dir])
+		ok, complete := pgsql.pgsqlMessageParser(priv.data[dir])
 		//logp.Debug("pgsqldetailed", "MessageParser returned ok=%v complete=%v", ok, complete)
 		if !ok {
 			// drop this tcp stream. Will retry parsing with the next
 			// segment in it
-			priv.Data[dir] = nil
-			logp.Debug("pgsql", "Ignore Postgresql message. Drop tcp stream. Try parsing with the next segment")
+			priv.data[dir] = nil
+			debugf("Ignore Postgresql message. Drop tcp stream. Try parsing with the next segment")
 			return priv
 		}
 
@@ -724,7 +264,7 @@ func (pgsql *Pgsql) Parse(pkt *protos.Packet, tcptuple *common.TcpTuple,
 			} else if stream.message.isSSLResponse {
 				// SSL request answered
 				stream.expectSSLResponse = false
-				priv.Data[1-dir].seenSSLRequest = false
+				priv.data[1-dir].seenSSLRequest = false
 			} else {
 				if stream.message.toExport {
 					pgsql.handlePgsql(pgsql, stream.message, tcptuple, dir, msg)
@@ -732,7 +272,7 @@ func (pgsql *Pgsql) Parse(pkt *protos.Packet, tcptuple *common.TcpTuple,
 			}
 
 			// and reset message
-			stream.PrepareForNewMessage()
+			stream.prepareForNewMessage()
 
 		} else {
 			// wait for more data
@@ -742,22 +282,21 @@ func (pgsql *Pgsql) Parse(pkt *protos.Packet, tcptuple *common.TcpTuple,
 	return priv
 }
 
-func messageHasEnoughData(msg *PgsqlMessage) bool {
+func messageHasEnoughData(msg *pgsqlMessage) bool {
 	if msg == nil {
 		return false
 	}
 	if msg.isSSLRequest || msg.isSSLResponse {
 		return false
 	}
-	if msg.IsRequest {
-		return len(msg.Query) > 0
-	} else {
-		return len(msg.Rows) > 0
+	if msg.isRequest {
+		return len(msg.query) > 0
 	}
+	return len(msg.rows) > 0
 }
 
 // Called when there's a drop packet
-func (pgsql *Pgsql) GapInStream(tcptuple *common.TcpTuple, dir uint8,
+func (pgsql *pgsqlPlugin) GapInStream(tcptuple *common.TCPTuple, dir uint8,
 	nbytes int, private protos.ProtocolData) (priv protos.ProtocolData, drop bool) {
 
 	defer logp.Recover("GapInPgsqlStream exception")
@@ -769,110 +308,107 @@ func (pgsql *Pgsql) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	if !ok {
 		return private, false
 	}
-	if pgsqlData.Data[dir] == nil {
+	if pgsqlData.data[dir] == nil {
 		return pgsqlData, false
 	}
 
 	// If enough data was received, send it to the
 	// next layer but mark it as incomplete.
-	stream := pgsqlData.Data[dir]
+	stream := pgsqlData.data[dir]
 	if messageHasEnoughData(stream.message) {
-		logp.Debug("pgsql", "Message not complete, but sending to the next layer")
+		debugf("Message not complete, but sending to the next layer")
 		m := stream.message
 		m.toExport = true
 		m.end = stream.parseOffset
-		if m.IsRequest {
-			m.Notes = append(m.Notes, "Packet loss while capturing the request")
+		if m.isRequest {
+			m.notes = append(m.notes, "Packet loss while capturing the request")
 		} else {
-			m.Notes = append(m.Notes, "Packet loss while capturing the response")
+			m.notes = append(m.notes, "Packet loss while capturing the response")
 		}
 
 		msg := stream.data[stream.message.start:stream.message.end]
 		pgsql.handlePgsql(pgsql, stream.message, tcptuple, dir, msg)
 
 		// and reset message
-		stream.PrepareForNewMessage()
+		stream.prepareForNewMessage()
 	}
 	return pgsqlData, true
 }
 
-func (pgsql *Pgsql) ReceivedFin(tcptuple *common.TcpTuple, dir uint8,
+func (pgsql *pgsqlPlugin) ReceivedFin(tcptuple *common.TCPTuple, dir uint8,
 	private protos.ProtocolData) protos.ProtocolData {
-
-	// TODO
 	return private
 }
 
-var handlePgsql = func(pgsql *Pgsql, m *PgsqlMessage, tcptuple *common.TcpTuple,
+var handlePgsql = func(pgsql *pgsqlPlugin, m *pgsqlMessage, tcptuple *common.TCPTuple,
 	dir uint8, raw_msg []byte) {
 
-	m.TcpTuple = *tcptuple
-	m.Direction = dir
-	m.CmdlineTuple = procs.ProcWatcher.FindProcessesTuple(tcptuple.IpPort())
+	m.tcpTuple = *tcptuple
+	m.direction = dir
+	m.cmdlineTuple = procs.ProcWatcher.FindProcessesTuple(tcptuple.IPPort())
 
-	if m.IsRequest {
+	if m.isRequest {
 		pgsql.receivedPgsqlRequest(m)
 	} else {
 		pgsql.receivedPgsqlResponse(m)
 	}
 }
 
-func (pgsql *Pgsql) receivedPgsqlRequest(msg *PgsqlMessage) {
+func (pgsql *pgsqlPlugin) receivedPgsqlRequest(msg *pgsqlMessage) {
 
-	tuple := msg.TcpTuple
+	tuple := msg.tcpTuple
 
 	// parse the query, as it might contain a list of pgsql command
 	// separated by ';'
-	queries := pgsqlQueryParser(msg.Query)
+	queries := pgsqlQueryParser(msg.query)
 
 	logp.Debug("pgsqldetailed", "Queries (%d) :%s", len(queries), queries)
 
 	transList := pgsql.getTransaction(tuple.Hashable())
 	if transList == nil {
-		transList = []*PgsqlTransaction{}
+		transList = []*pgsqlTransaction{}
 	}
 
 	for _, query := range queries {
 
-		trans := &PgsqlTransaction{Type: "pgsql", tuple: tuple}
+		trans := &pgsqlTransaction{tuple: tuple}
 
-		trans.ts = msg.Ts
-		trans.Ts = int64(trans.ts.UnixNano() / 1000) // transactions have microseconds resolution
-		trans.JsTs = msg.Ts
-		trans.Src = common.Endpoint{
-			Ip:   msg.TcpTuple.Src_ip.String(),
-			Port: msg.TcpTuple.Src_port,
-			Proc: string(msg.CmdlineTuple.Src),
+		trans.ts = msg.ts
+		trans.src = common.Endpoint{
+			IP:   msg.tcpTuple.SrcIP.String(),
+			Port: msg.tcpTuple.SrcPort,
+			Proc: string(msg.cmdlineTuple.Src),
 		}
-		trans.Dst = common.Endpoint{
-			Ip:   msg.TcpTuple.Dst_ip.String(),
-			Port: msg.TcpTuple.Dst_port,
-			Proc: string(msg.CmdlineTuple.Dst),
+		trans.dst = common.Endpoint{
+			IP:   msg.tcpTuple.DstIP.String(),
+			Port: msg.tcpTuple.DstPort,
+			Proc: string(msg.cmdlineTuple.Dst),
 		}
-		if msg.Direction == tcp.TcpDirectionReverse {
-			trans.Src, trans.Dst = trans.Dst, trans.Src
+		if msg.direction == tcp.TCPDirectionReverse {
+			trans.src, trans.dst = trans.dst, trans.src
 		}
 
-		trans.Pgsql = common.MapStr{}
-		trans.Query = query
-		trans.Method = getQueryMethod(query)
-		trans.BytesIn = msg.Size
+		trans.pgsql = common.MapStr{}
+		trans.query = query
+		trans.method = getQueryMethod(query)
+		trans.bytesIn = msg.size
 
-		trans.Notes = msg.Notes
+		trans.notes = msg.notes
 
-		trans.Request_raw = query
+		trans.requestRaw = query
 
 		transList = append(transList, trans)
 	}
 	pgsql.transactions.Put(tuple.Hashable(), transList)
 }
 
-func (pgsql *Pgsql) receivedPgsqlResponse(msg *PgsqlMessage) {
+func (pgsql *pgsqlPlugin) receivedPgsqlResponse(msg *pgsqlMessage) {
 
-	tuple := msg.TcpTuple
+	tuple := msg.tcpTuple
 	transList := pgsql.getTransaction(tuple.Hashable())
 	if transList == nil || len(transList) == 0 {
-		logp.Warn("Response from unknown transaction. Ignoring.")
+		debugf("Response from unknown transaction. Ignoring.")
+		unmatchedResponses.Add(1)
 		return
 	}
 
@@ -880,32 +416,33 @@ func (pgsql *Pgsql) receivedPgsqlResponse(msg *PgsqlMessage) {
 	trans := pgsql.removeTransaction(transList, tuple, 0)
 
 	// check if the request was received
-	if trans.Pgsql == nil {
-		logp.Warn("Response from unknown transaction. Ignoring.")
+	if trans.pgsql == nil {
+		debugf("Response from unknown transaction. Ignoring.")
+		unmatchedResponses.Add(1)
 		return
 	}
 
-	trans.Pgsql.Update(common.MapStr{
-		"iserror":        msg.IsError,
-		"num_rows":       msg.NumberOfRows,
-		"num_fields":     msg.NumberOfFields,
-		"error_code":     msg.ErrorCode,
-		"error_message":  msg.ErrorInfo,
-		"error_severity": msg.ErrorSeverity,
+	trans.pgsql.Update(common.MapStr{
+		"iserror":        msg.isError,
+		"num_rows":       msg.numberOfRows,
+		"num_fields":     msg.numberOfFields,
+		"error_code":     msg.errorCode,
+		"error_message":  msg.errorInfo,
+		"error_severity": msg.errorSeverity,
 	})
-	trans.BytesOut = msg.Size
+	trans.bytesOut = msg.size
 
-	trans.ResponseTime = int32(msg.Ts.Sub(trans.ts).Nanoseconds() / 1e6) // resp_time in milliseconds
-	trans.Response_raw = common.DumpInCSVFormat(msg.Fields, msg.Rows)
+	trans.responseTime = int32(msg.ts.Sub(trans.ts).Nanoseconds() / 1e6) // resp_time in milliseconds
+	trans.responseRaw = common.DumpInCSVFormat(msg.fields, msg.rows)
 
-	trans.Notes = append(trans.Notes, msg.Notes...)
+	trans.notes = append(trans.notes, msg.notes...)
 
 	pgsql.publishTransaction(trans)
 
-	logp.Debug("pgsql", "Postgres transaction completed: %s\n%s", trans.Pgsql, trans.Response_raw)
+	debugf("Postgres transaction completed: %s\n%s", trans.pgsql, trans.responseRaw)
 }
 
-func (pgsql *Pgsql) publishTransaction(t *PgsqlTransaction) {
+func (pgsql *pgsqlPlugin) publishTransaction(t *pgsqlTransaction) {
 
 	if pgsql.results == nil {
 		return
@@ -914,37 +451,37 @@ func (pgsql *Pgsql) publishTransaction(t *PgsqlTransaction) {
 	event := common.MapStr{}
 
 	event["type"] = "pgsql"
-	if t.Pgsql["iserror"].(bool) {
+	if t.pgsql["iserror"].(bool) {
 		event["status"] = common.ERROR_STATUS
 	} else {
 		event["status"] = common.OK_STATUS
 	}
-	event["responsetime"] = t.ResponseTime
-	if pgsql.Send_request {
-		event["request"] = t.Request_raw
+	event["responsetime"] = t.responseTime
+	if pgsql.sendRequest {
+		event["request"] = t.requestRaw
 	}
-	if pgsql.Send_response {
-		event["response"] = t.Response_raw
+	if pgsql.sendResponse {
+		event["response"] = t.responseRaw
 	}
-	event["query"] = t.Query
-	event["method"] = t.Method
-	event["bytes_out"] = t.BytesOut
-	event["bytes_in"] = t.BytesIn
-	event["pgsql"] = t.Pgsql
+	event["query"] = t.query
+	event["method"] = t.method
+	event["bytes_out"] = t.bytesOut
+	event["bytes_in"] = t.bytesIn
+	event["pgsql"] = t.pgsql
 
 	event["@timestamp"] = common.Time(t.ts)
-	event["src"] = &t.Src
-	event["dst"] = &t.Dst
+	event["src"] = &t.src
+	event["dst"] = &t.dst
 
-	if len(t.Notes) > 0 {
-		event["notes"] = t.Notes
+	if len(t.notes) > 0 {
+		event["notes"] = t.notes
 	}
 
 	pgsql.results.PublishTransaction(event)
 }
 
-func (pgsql *Pgsql) removeTransaction(transList []*PgsqlTransaction,
-	tuple common.TcpTuple, index int) *PgsqlTransaction {
+func (pgsql *pgsqlPlugin) removeTransaction(transList []*pgsqlTransaction,
+	tuple common.TCPTuple, index int) *pgsqlTransaction {
 
 	trans := transList[index]
 	transList = append(transList[:index], transList[index+1:]...)

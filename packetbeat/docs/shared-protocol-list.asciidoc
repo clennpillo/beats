@@ -7,10 +7,11 @@
  - ICMP (v4 and v6)
  - DNS
  - HTTP
+ - AMQP 0.9.1
+ - Cassandra
  - Mysql
  - PostgreSQL
  - Redis
  - Thrift-RPC
  - MongoDB
  - Memcache
- 

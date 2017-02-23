@@ -1,12 +1,11 @@
+// +build !integration
+
 package common
 
 import (
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/yaml.v2"
 )
 
 func TestMapStrUpdate(t *testing.T) {
@@ -43,125 +42,156 @@ func TestMapStrUnion(t *testing.T) {
 	assert.Equal(c, MapStr{"a": 1, "b": 3, "c": 4})
 }
 
-func TestEnsureTimestampField(t *testing.T) {
+func TestMapStrCopyFieldsTo(t *testing.T) {
+	assert := assert.New(t)
 
-	type io struct {
-		Input  MapStr
-		Output MapStr
-	}
-
-	tests := []io{
-		// should add a @timestamp field if it doesn't exists.
-		{
-			Input: MapStr{},
-			Output: MapStr{
-				"@timestamp": MustParseTime("2015-03-01T12:34:56.123Z"),
-			},
+	m := MapStr{
+		"a": MapStr{
+			"a1": 2,
+			"a2": 3,
 		},
-		// should convert from string to Time
-		{
-			Input: MapStr{"@timestamp": "2015-03-01T12:34:57.123Z"},
-			Output: MapStr{
-				"@timestamp": MustParseTime("2015-03-01T12:34:57.123Z"),
-			},
-		},
-		// should convert from time.Time to Time
-		{
-			Input: MapStr{
-				"@timestamp": time.Date(2015, time.March, 01,
-					12, 34, 57, 123*1e6, time.UTC),
-			},
-			Output: MapStr{
-				"@timestamp": MustParseTime("2015-03-01T12:34:57.123Z"),
-			},
-		},
-		// should leave a Time alone
-		{
-			Input: MapStr{
-				"@timestamp": MustParseTime("2015-03-01T12:34:57.123Z"),
-			},
-			Output: MapStr{
-				"@timestamp": MustParseTime("2015-03-01T12:34:57.123Z"),
+		"b": 2,
+		"c": MapStr{
+			"c1": 1,
+			"c2": 2,
+			"c3": MapStr{
+				"c31": 1,
+				"c32": 2,
 			},
 		},
 	}
+	c := MapStr{}
 
-	now := func() time.Time {
-		return time.Date(2015, time.March, 01, 12, 34, 56, 123*1e6, time.UTC)
-	}
+	err := m.CopyFieldsTo(c, "dd")
+	assert.Error(err)
+	assert.Equal(MapStr{}, c)
 
-	for _, test := range tests {
-		m := test.Input
-		err := m.EnsureTimestampField(now)
-		assert.Nil(t, err)
-		assert.Equal(t, test.Output, m)
-	}
+	err = m.CopyFieldsTo(c, "a")
+	assert.Equal(nil, err)
+	assert.Equal(MapStr{"a": MapStr{"a1": 2, "a2": 3}}, c)
+
+	err = m.CopyFieldsTo(c, "c.c1")
+	assert.Equal(nil, err)
+	assert.Equal(MapStr{"a": MapStr{"a1": 2, "a2": 3}, "c": MapStr{"c1": 1}}, c)
+
+	err = m.CopyFieldsTo(c, "b")
+	assert.Equal(nil, err)
+	assert.Equal(MapStr{"a": MapStr{"a1": 2, "a2": 3}, "c": MapStr{"c1": 1}, "b": 2}, c)
+
+	err = m.CopyFieldsTo(c, "c.c3.c32")
+	assert.Equal(nil, err)
+	assert.Equal(MapStr{"a": MapStr{"a1": 2, "a2": 3}, "c": MapStr{"c1": 1, "c3": MapStr{"c32": 2}}, "b": 2}, c)
 }
 
-func TestEnsureTimestampFieldNegative(t *testing.T) {
+func TestMapStrDelete(t *testing.T) {
+	assert := assert.New(t)
 
-	inputs := []MapStr{
-		// should error on invalid string layout (microseconds)
-		{
-			"@timestamp": "2015-03-01T12:34:57.123456Z",
+	m := MapStr{
+		"c": MapStr{
+			"c1": 1,
+			"c2": 2,
+			"c3": MapStr{
+				"c31": 1,
+				"c32": 2,
+			},
 		},
-		// should error when the @timestamp is an integer
-		{
-			"@timestamp": 123456678,
-		},
 	}
 
-	now := func() time.Time {
-		return time.Date(2015, time.March, 01, 12, 34, 56, 123*1e6, time.UTC)
-	}
+	err := m.Delete("c.c2")
+	assert.Equal(nil, err)
+	assert.Equal(MapStr{"c": MapStr{"c1": 1, "c3": MapStr{"c31": 1, "c32": 2}}}, m)
 
-	for _, input := range inputs {
-		m := input
-		err := m.EnsureTimestampField(now)
-		assert.NotNil(t, err)
-	}
+	err = m.Delete("c.c2.c21")
+	assert.NotEqual(nil, err)
+	assert.Equal(MapStr{"c": MapStr{"c1": 1, "c3": MapStr{"c31": 1, "c32": 2}}}, m)
+
+	err = m.Delete("c.c3.c31")
+	assert.Equal(nil, err)
+	assert.Equal(MapStr{"c": MapStr{"c1": 1, "c3": MapStr{"c32": 2}}}, m)
+
+	err = m.Delete("c")
+	assert.Equal(nil, err)
+	assert.Equal(MapStr{}, m)
 }
 
-func TestEnsureCountFiled(t *testing.T) {
-	type io struct {
-		Input  MapStr
-		Output MapStr
-	}
-	tests := []io{
-		// should add a count field if there is none
-		{
-			Input: MapStr{
-				"a": "b",
-			},
-			Output: MapStr{
-				"a":     "b",
-				"count": 1,
-			},
-		},
+func TestHasKey(t *testing.T) {
+	assert := assert.New(t)
 
-		// should do nothing if there is already a count
-		{
-			Input: MapStr{
-				"count": 1,
+	m := MapStr{
+		"c": MapStr{
+			"c1": 1,
+			"c2": 2,
+			"c3": MapStr{
+				"c31": 1,
+				"c32": 2,
 			},
-			Output: MapStr{
-				"count": 1,
-			},
-		},
-
-		// should add count on an empty dict
-		{
-			Input:  MapStr{},
-			Output: MapStr{"count": 1},
 		},
 	}
 
-	for _, test := range tests {
-		m := test.Input
-		err := m.EnsureCountField()
-		assert.Nil(t, err)
-		assert.Equal(t, test.Output, m)
+	hasKey, err := m.HasKey("c.c2")
+	assert.Equal(nil, err)
+	assert.Equal(true, hasKey)
+
+	hasKey, err = m.HasKey("c.c4")
+	assert.Equal(nil, err)
+	assert.Equal(false, hasKey)
+
+	hasKey, err = m.HasKey("c.c3.c32")
+	assert.Equal(nil, err)
+	assert.Equal(true, hasKey)
+
+	hasKey, err = m.HasKey("dd")
+	assert.Equal(nil, err)
+	assert.Equal(false, hasKey)
+}
+
+func TestMapStrPut(t *testing.T) {
+	m := MapStr{
+		"subMap": MapStr{
+			"a": 1,
+		},
 	}
+
+	// Add new value to the top-level.
+	v, err := m.Put("a", "ok")
+	assert.NoError(t, err)
+	assert.Nil(t, v)
+	assert.Equal(t, MapStr{"a": "ok", "subMap": MapStr{"a": 1}}, m)
+
+	// Add new value to subMap.
+	v, err = m.Put("subMap.b", 2)
+	assert.NoError(t, err)
+	assert.Nil(t, v)
+	assert.Equal(t, MapStr{"a": "ok", "subMap": MapStr{"a": 1, "b": 2}}, m)
+
+	// Overwrite a value in subMap.
+	v, err = m.Put("subMap.a", 2)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, v)
+	assert.Equal(t, MapStr{"a": "ok", "subMap": MapStr{"a": 2, "b": 2}}, m)
+
+	// Add value to map that does not exist.
+	m = MapStr{}
+	v, err = m.Put("subMap.newMap.a", 1)
+	assert.NoError(t, err)
+	assert.Nil(t, v)
+	assert.Equal(t, MapStr{"subMap": MapStr{"newMap": MapStr{"a": 1}}}, m)
+}
+
+func TestClone(t *testing.T) {
+	assert := assert.New(t)
+
+	m := MapStr{
+		"c1": 1,
+		"c2": 2,
+		"c3": MapStr{
+			"c31": 1,
+			"c32": 2,
+		},
+	}
+
+	c := m.Clone()
+	assert.Equal(MapStr{"c31": 1, "c32": 2}, c["c3"])
 }
 
 func TestString(t *testing.T) {
@@ -188,83 +218,165 @@ func TestString(t *testing.T) {
 	}
 }
 
-func TestUnmarshalYAML(t *testing.T) {
+// Smoke test. The method has no observable outputs so this
+// is only verifying there are no panics.
+func TestStringToPrint(t *testing.T) {
+	m := MapStr{}
+
+	assert.Equal(t, "{}", m.StringToPrint())
+	assert.Equal(t, true, len(m.StringToPrint()) > 0)
+}
+
+func TestMergeFields(t *testing.T) {
 	type io struct {
-		InputLines []string
-		Output     MapStr
+		UnderRoot bool
+		Event     MapStr
+		Fields    MapStr
+		Output    MapStr
+		Err       string
 	}
 	tests := []io{
-		// should return nil for empty document
+		// underRoot = true, merges
 		{
-			InputLines: []string{},
-			Output:     nil,
-		},
-		// should handle scalar values
-		{
-			InputLines: []string{
-				"a: b",
-				"c: true",
-				"123: 456",
+			UnderRoot: true,
+			Event: MapStr{
+				"a": "1",
+			},
+			Fields: MapStr{
+				"b": 2,
 			},
 			Output: MapStr{
-				"a":   "b",
-				"c":   "true",
-				"123": "456",
+				"a": "1",
+				"b": 2,
 			},
 		},
-		// should handle array with scalar values
+
+		// underRoot = true, overwrites existing
 		{
-			InputLines: []string{
-				"a:",
-				"  - b",
-				"  - true",
-				"  - 123",
+			UnderRoot: true,
+			Event: MapStr{
+				"a": "1",
+			},
+			Fields: MapStr{
+				"a": 2,
 			},
 			Output: MapStr{
-				"a": []interface{}{"b", "true", "123"},
+				"a": 2,
 			},
 		},
-		// should handle array with nested map
+
+		// underRoot = false, adds new 'fields' when it doesn't exist
 		{
-			InputLines: []string{
-				"a:",
-				"  - b: c",
-				"    d: true",
-				"    123: 456",
+			UnderRoot: false,
+			Event: MapStr{
+				"a": "1",
+			},
+			Fields: MapStr{
+				"a": 2,
 			},
 			Output: MapStr{
-				"a": []interface{}{
-					MapStr{
-						"b":   "c",
-						"d":   "true",
-						"123": "456",
-					},
+				"a": "1",
+				"fields": MapStr{
+					"a": 2,
 				},
 			},
 		},
-		// should handle nested map
+
+		// underRoot = false, merge with existing 'fields' and overwrites existing keys
 		{
-			InputLines: []string{
-				"a: ",
-				"  b: c",
-				"  d: true",
-				"  123: 456",
-			},
-			Output: MapStr{
-				"a": MapStr{
-					"b":   "c",
-					"d":   "true",
-					"123": "456",
+			UnderRoot: false,
+			Event: MapStr{
+				"fields": MapStr{
+					"a": "1",
+					"b": 2,
 				},
 			},
+			Fields: MapStr{
+				"a": 3,
+				"c": 4,
+			},
+			Output: MapStr{
+				"fields": MapStr{
+					"a": 3,
+					"b": 2,
+					"c": 4,
+				},
+			},
+		},
+
+		// underRoot = false, error when 'fields' is wrong type
+		{
+			UnderRoot: false,
+			Event: MapStr{
+				"fields": "not a MapStr",
+			},
+			Fields: MapStr{
+				"a": 3,
+			},
+			Output: MapStr{
+				"fields": "not a MapStr",
+			},
+			Err: "expected map",
 		},
 	}
+
 	for _, test := range tests {
-		var actual MapStr
-		if err := yaml.Unmarshal([]byte(strings.Join(test.InputLines, "\n")), &actual); err != nil {
-			assert.Fail(t, "YAML unmarshaling unexpectedly failed: %s", err)
-			continue
+		err := MergeFields(test.Event, test.Fields, test.UnderRoot)
+		assert.Equal(t, test.Output, test.Event)
+		if test.Err != "" {
+			assert.Contains(t, err.Error(), test.Err)
+		} else {
+			assert.NoError(t, err)
 		}
-		assert.Equal(t, test.Output, actual)
+	}
+}
+
+func TestAddTag(t *testing.T) {
+	type io struct {
+		Event  MapStr
+		Tags   []string
+		Output MapStr
+		Err    string
+	}
+	tests := []io{
+		// No existing tags, creates new tag array
+		{
+			Event: MapStr{},
+			Tags:  []string{"json"},
+			Output: MapStr{
+				"tags": []string{"json"},
+			},
+		},
+		// Existing tags, appends
+		{
+			Event: MapStr{
+				"tags": []string{"json"},
+			},
+			Tags: []string{"docker"},
+			Output: MapStr{
+				"tags": []string{"json", "docker"},
+			},
+		},
+		// Existing tags is not a []string
+		{
+			Event: MapStr{
+				"tags": "not a slice",
+			},
+			Tags: []string{"docker"},
+			Output: MapStr{
+				"tags": "not a slice",
+			},
+			Err: "expected string array",
+		},
+	}
+
+	for _, test := range tests {
+		err := AddTags(test.Event, test.Tags)
+		assert.Equal(t, test.Output, test.Event)
+		if test.Err != "" {
+			assert.Contains(t, err.Error(), test.Err)
+		} else {
+			assert.NoError(t, err)
+		}
 	}
 }

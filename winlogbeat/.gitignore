@@ -21,8 +21,8 @@ _testmain.go
 *.out
 *.log
 *.bak
-*.winlogbeat.yaml
-etc/*.dev.yml
+*.winlogbeat.yml
+_meta/*.dev.yml
 
 cover/
 /tests/system/env/
