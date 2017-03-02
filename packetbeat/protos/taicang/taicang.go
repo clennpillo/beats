@@ -2,16 +2,15 @@ package taicang
 
 import (
 	"bytes"
+	"expvar"
 	"net/url"
 	"strings"
 	"time"
-	_ "fmt"
 	_ "strconv"
 
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
 
-	"github.com/elastic/beats/packetbeat/config"
 	"github.com/elastic/beats/packetbeat/procs"
 	"github.com/elastic/beats/packetbeat/protos"
 	"github.com/elastic/beats/packetbeat/protos/tcp"
@@ -33,8 +32,12 @@ const (
 	stateBodyChunkedWaitFinalCRLF
 )
 
+var (
+	unmatchedResponses = expvar.NewInt("taicang.unmatched_responses")
+)
+
 type stream struct {
-	tcptuple *common.TcpTuple
+	tcptuple *common.TCPTuple
 
 	data []byte
 
@@ -46,7 +49,7 @@ type stream struct {
 }
 
 type taicangConnectionData struct {
-	Streams   [2]*stream
+	streams   [2]*stream
 	requests  messageList
 	responses messageList
 }
@@ -55,15 +58,17 @@ type messageList struct {
 	head, tail *message
 }
 
-// taicang application level protocol analyser plugin.
-type Taicang struct {
+// Taicang application level protocol analyser plugin.
+type taicangPlugin struct {
 	// config
-	Ports               []int
-	SendRequest         bool
-	SendResponse        bool
-	SplitCookie         bool
-	HideKeywords        []string
-	RedactAuthorization bool
+	ports               []int
+	sendRequest         bool
+	sendResponse        bool
+	splitCookie         bool
+	hideKeywords        []string
+	redactAuthorization bool
+	includeBodyFor      []string
+	maxMessageSize      int
 
 	parserConfig parserConfig
 
@@ -77,90 +82,76 @@ var (
 	isDetailed = false
 )
 
-func (taicang *Taicang) initDefaults() {
-	taicang.SendRequest = false
-	taicang.SendResponse = false
-	taicang.RedactAuthorization = false
-	taicang.transactionTimeout = protos.DefaultTransactionExpiration
+func init() {
+	protos.Register("taicang", New)
 }
 
-func (taicang *Taicang) setFromConfig(config config.Taicang) (err error) {
-
-	taicang.Ports = config.Ports
-
-	if config.SendRequest != nil {
-		taicang.SendRequest = *config.SendRequest
-	}
-	if config.SendResponse != nil {
-		taicang.SendResponse = *config.SendResponse
-	}
-
-	if config.TransactionTimeout != nil && *config.TransactionTimeout > 0 {
-		taicang.transactionTimeout = time.Duration(*config.TransactionTimeout) * time.Second
-	}
-
-	return nil
-}
-
-// GetPorts lists the port numbers the Taicang protocol analyser will handle.
-func (taicang *Taicang) GetPorts() []int {
-	return taicang.Ports
-}
-
-// Init initializes the Taicang protocol analyser.
-func (taicang *Taicang) Init(testMode bool, results publish.Transactions) error {
-	taicang.initDefaults()
-
+func New(
+	testMode bool,
+	results publish.Transactions, 
+	cfg *common.Config,
+) (protos.Plugin, error) {
+	p := &taicangPlugin{}
+	config := defaultConfig
 	if !testMode {
-		err := taicang.setFromConfig(config.ConfigSingleton.Protocols.Taicang)
-		if err != nil {
-			return err
+		if err := cfg.Unpack(&config); err != nil {
+			return nil, err
 		}
 	}
 
+	if err := p.init(results, &config); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// Init initializes the Taicang protocol analyser.
+func (taicang *taicangPlugin) init(results publish.Transactions, config *taicangConfig) error {
+	taicang.setFromConfig(config)
+
 	isDebug = logp.IsDebug("taicang")
 	isDetailed = logp.IsDebug("taicangdetailed")
-
 	taicang.results = results
-
 	return nil
+}
+
+func (taicang *taicangPlugin) setFromConfig(config *taicangConfig) {
+	taicang.ports = config.Ports
+	taicang.sendRequest = config.SendRequest
+	taicang.sendResponse = config.SendResponse
+	taicang.hideKeywords = config.HideKeywords
+	taicang.redactAuthorization = config.RedactAuthorization
+	taicang.splitCookie = config.SplitCookie
+	taicang.parserConfig.realIPHeader = strings.ToLower(config.RealIPHeader)
+	taicang.transactionTimeout = config.TransactionTimeout
+	taicang.includeBodyFor = config.IncludeBodyFor
+	taicang.maxMessageSize = config.MaxMessageSize
+
+	if config.SendAllHeaders {
+		taicang.parserConfig.sendHeaders = true
+		taicang.parserConfig.sendAllHeaders = true
+	} else {
+		if len(config.SendHeaders) > 0 {
+			taicang.parserConfig.sendHeaders = true
+
+			taicang.parserConfig.headersWhitelist = map[string]bool{}
+			for _, hdr := range config.SendHeaders {
+				taicang.parserConfig.headersWhitelist[strings.ToLower(hdr)] = true
+			}
+		}
+	}
+}
+
+// GetPorts lists the port numbers the Taicang protocol analyser will handle.
+func (taicang *taicangPlugin) GetPorts() []int {
+	return taicang.ports
 }
 
 // messageGap is called when a gap of size `nbytes` is found in the
 // tcp stream. Decides if we can ignore the gap or it's a parser error
 // and we need to drop the stream.
-func (taicang *Taicang) messageGap(s *stream, nbytes int) (ok bool, complete bool) {
-
-	m := s.message
-	switch s.parseState {
-	case stateStart, stateHeaders:
-		// we know we cannot recover from these
-		return false, false
-	case stateBody:
-		if isDebug {
-			debugf("gap in body: %d", nbytes)
-		}
-
-		if m.IsRequest {
-			m.Notes = append(m.Notes, "Packet loss while capturing the request")
-		} else {
-			m.Notes = append(m.Notes, "Packet loss while capturing the response")
-		}
-		if !m.hasContentLength && (bytes.Equal(m.connection, constClose) ||
-			(isVersion(m.version, 1, 0) && !bytes.Equal(m.connection, constKeepAlive))) {
-
-			s.bodyReceived += nbytes
-			m.ContentLength += nbytes
-			return true, false
-		} else if len(s.data[s.parseOffset:])+nbytes >= m.ContentLength-s.bodyReceived {
-			// we're done, but the last portion of the data is gone
-			m.end = s.parseOffset
-			return true, true
-		} else {
-			s.bodyReceived += nbytes
-			return true, false
-		}
-	}
+func (taicang *taicangPlugin) messageGap(s *stream, nbytes int) (ok bool, complete bool) {
+	
 	// assume we cannot recover
 	return false, false
 }
@@ -175,26 +166,26 @@ func (st *stream) PrepareForNewMessage() {
 
 // Called when the parser has identified the boundary
 // of a message.
-func (taicang *Taicang) messageComplete(
+func (taicang *taicangPlugin) messageComplete(
 	conn *taicangConnectionData,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 	st *stream,
 ) {
-	st.message.Raw = st.data[st.message.start:st.message.end]
+	st.message.raw = st.data[st.message.start:st.message.end]
 
 	taicang.handleTaicang(conn, st.message, tcptuple, dir)
 }
 
 // ConnectionTimeout returns the configured Taicang transaction timeout.
-func (taicang *Taicang) ConnectionTimeout() time.Duration {
+func (taicang *taicangPlugin) ConnectionTimeout() time.Duration {
 	return taicang.transactionTimeout
 }
 
 // Parse function is used to process TCP payloads.
-func (taicang *Taicang) Parse(
+func (taicang *taicangPlugin) Parse(
 	pkt *protos.Packet,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 	private protos.ProtocolData,
 ) protos.ProtocolData {
@@ -235,10 +226,10 @@ func getTaicangConnection(private protos.ProtocolData) *taicangConnectionData {
 }
 
 // Parse function is used to process TCP payloads.
-func (taicang *Taicang) doParse(
+func (taicang *taicangPlugin) doParse(
 	conn *taicangConnectionData,
 	pkt *protos.Packet,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 ) *taicangConnectionData {
 
@@ -246,33 +237,35 @@ func (taicang *Taicang) doParse(
 		detailedf("Payload received: [%s]", pkt.Payload)
 	}
 
-	st := conn.Streams[dir]
+	extraMsgSize := 0 // size of a "seen" packet for which we don't store the actual bytes
+
+	st := conn.streams[dir]
 	if st == nil {
 		st = newStream(pkt, tcptuple)
-		conn.Streams[dir] = st
+		conn.streams[dir] = st
 	} else {
 		// concatenate bytes
-		st.data = append(st.data, pkt.Payload...)
-		if len(st.data) > tcp.TCP_MAX_DATA_IN_STREAM {
+		if len(st.data)+len(pkt.Payload) > taicang.maxMessageSize {
 			if isDebug {
-				debugf("Stream data too large, dropping TCP stream")
+				debugf("Stream data too large, ignoring message")
 			}
-			conn.Streams[dir] = nil
-			return conn
+			extraMsgSize = len(pkt.Payload)
+		} else {
+			st.data = append(st.data, pkt.Payload...)
 		}
 	}
 
 	for len(st.data) > 0 {
 		if st.message == nil {
-			st.message = &message{Ts: pkt.Ts}
+			st.message = &message{ts: pkt.Ts}
 		}
 
 		parser := newParser(&taicang.parserConfig)
-		ok, complete := parser.parse(st)
+		ok, complete := parser.parse(st, extraMsgSize)
 		if !ok {
 			// drop this tcp stream. Will retry parsing with the next
 			// segment in it
-			conn.Streams[dir] = nil
+			conn.streams[dir] = nil
 			return conn
 		}
 
@@ -284,43 +277,38 @@ func (taicang *Taicang) doParse(
 		// all ok, ship it
 		taicang.messageComplete(conn, tcptuple, dir, st)
 
-		debugf("message complete")
-		
 		// and reset stream for next message
 		st.PrepareForNewMessage()
-		
-		debugf("prepare new")
 	}
 
 	return conn
 }
 
-func newStream(pkt *protos.Packet, tcptuple *common.TcpTuple) *stream {
+func newStream(pkt *protos.Packet, tcptuple *common.TCPTuple) *stream {
 	return &stream{
 		tcptuple: tcptuple,
 		data:     pkt.Payload,
-		message:  &message{Ts: pkt.Ts},
+		message:  &message{ts: pkt.Ts},
 	}
 }
 
 // ReceivedFin will be called when TCP transaction is terminating.
-func (taicang *Taicang) ReceivedFin(tcptuple *common.TcpTuple, dir uint8,
+func (taicang *taicangPlugin) ReceivedFin(tcptuple *common.TCPTuple, dir uint8,
 	private protos.ProtocolData) protos.ProtocolData {
 
+	debugf("Received FIN")
 	conn := getTaicangConnection(private)
 	if conn == nil {
 		return private
 	}
 
-	stream := conn.Streams[dir]
+	stream := conn.streams[dir]
 	if stream == nil {
 		return conn
 	}
 
-	// send whatever data we got so far as complete. This
-	// is needed for the Taicang/1.0 without Content-Length situation.
 	if stream.message != nil && len(stream.data[stream.message.start:]) > 0 {
-		stream.message.Raw = stream.data[stream.message.start:]
+		stream.message.raw = stream.data[stream.message.start:]
 		taicang.handleTaicang(conn, stream.message, tcptuple, dir)
 
 		// and reset message. Probably not needed, just to be sure.
@@ -332,7 +320,7 @@ func (taicang *Taicang) ReceivedFin(tcptuple *common.TcpTuple, dir uint8,
 
 // GapInStream is called when a gap of nbytes bytes is found in the stream (due
 // to packet loss).
-func (taicang *Taicang) GapInStream(tcptuple *common.TcpTuple, dir uint8,
+func (taicang *taicangPlugin) GapInStream(tcptuple *common.TCPTuple, dir uint8,
 	nbytes int, private protos.ProtocolData) (priv protos.ProtocolData, drop bool) {
 
 	defer logp.Recover("GapInStream(taicang) exception")
@@ -342,7 +330,7 @@ func (taicang *Taicang) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 		return private, false
 	}
 
-	stream := conn.Streams[dir]
+	stream := conn.streams[dir]
 	if stream == nil || stream.message == nil {
 		// nothing to do
 		return private, false
@@ -354,7 +342,7 @@ func (taicang *Taicang) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	}
 	if !ok {
 		// on errors, drop stream
-		conn.Streams[dir] = nil
+		conn.streams[dir] = nil
 		return conn, true
 	}
 
@@ -367,52 +355,43 @@ func (taicang *Taicang) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	return private, false
 }
 
-func (taicang *Taicang) RemovalListener(data protos.ProtocolData) {
-	if conn, ok := data.(*taicangConnectionData); ok {
-		if !conn.requests.empty() && conn.responses.empty() {
-			requ := conn.requests.pop()
-			resp := &message{
-				StatusCode: 700,
-			}
-			result := taicang.newTransaction(requ, resp)
-			taicang.results.PublishTransaction(result)
-		}
-	} else {
-		logp.Warn("Not a taicangConnectionData")
-	}
-}
-
-func (taicang *Taicang) handleTaicang(
+func (taicang *taicangPlugin) handleTaicang(
 	conn *taicangConnectionData,
 	m *message,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 ) {
 
-	m.TCPTuple = *tcptuple
-	m.Direction = dir
-	m.CmdlineTuple = procs.ProcWatcher.FindProcessesTuple(tcptuple.IpPort())
+	m.tcpTuple = *tcptuple
+	m.direction = dir
+	m.cmdlineTuple = procs.ProcWatcher.FindProcessesTuple(tcptuple.IPPort())
 	taicang.hideHeaders(m)
 
-	if m.IsRequest {
+	if m.isRequest {
 		if isDebug {
-			debugf("Received request with tuple: %s", m.TCPTuple)
+			debugf("Received request with tuple: %s", m.tcpTuple)
+		}
+		if conn.requests.tail != nil {
+			for !conn.requests.empty() {
+				conn.requests.pop()
+			}
 		}
 		conn.requests.append(m)
 	} else {
 		if isDebug {
-			debugf("Received response with tuple: %s", m.TCPTuple)
+			debugf("Received response with tuple: %s", m.tcpTuple)
 		}
 		conn.responses.append(m)
 		taicang.correlate(conn)
 	}
 }
 
-func (taicang *Taicang) correlate(conn *taicangConnectionData) {
+func (taicang *taicangPlugin) correlate(conn *taicangConnectionData) {
 	// drop responses with missing requests
 	if conn.requests.empty() {
 		for !conn.responses.empty() {
-			logp.Warn("Response from unknown transaction. Ingoring.")
+			debugf("Response from unknown transaction. Ingoring.")
+			unmatchedResponses.Add(1)
 			conn.responses.pop()
 		}
 		return
@@ -431,89 +410,105 @@ func (taicang *Taicang) correlate(conn *taicangConnectionData) {
 	}
 }
 
-func (taicang *Taicang) newTransaction(requ, resp *message) common.MapStr {
+func (taicang *taicangPlugin) newTransaction(requ, resp *message) common.MapStr {
 	status := common.OK_STATUS
-	if resp.StatusCode >= 400 {
+	if resp.statusCode >= 400 {
 		status = common.ERROR_STATUS
 	}
 
 	// resp_time in milliseconds
-	responseTime := int32(resp.Ts.Sub(requ.Ts).Nanoseconds() / 1e6)
+	responseTime := int32(resp.ts.Sub(requ.ts).Nanoseconds() / 1e6)
 
 	src := common.Endpoint{
-		Ip:   requ.TCPTuple.Src_ip.String(),
-		Port: requ.TCPTuple.Src_port,
-		Proc: string(requ.CmdlineTuple.Src),
+		IP:   requ.tcpTuple.SrcIP.String(),
+		Port: requ.tcpTuple.SrcPort,
+		Proc: string(requ.cmdlineTuple.Src),
 	}
 	dst := common.Endpoint{
-		Ip:   requ.TCPTuple.Dst_ip.String(),
-		Port: requ.TCPTuple.Dst_port,
-		Proc: string(requ.CmdlineTuple.Dst),
+		IP:   requ.tcpTuple.DstIP.String(),
+		Port: requ.tcpTuple.DstPort,
+		Proc: string(requ.cmdlineTuple.Dst),
 	}
-	if requ.Direction == tcp.TcpDirectionReverse {
+	if requ.direction == tcp.TCPDirectionReverse {
 		src, dst = dst, src
 	}
 
-	ts := requ.Ts
-
 	event := common.MapStr{
-		"@timestamp":   common.Time(ts),
-		"status":       status,
+		"@timestamp":   common.Time(requ.ts),
 		"type":         "taicang",
+		"status":       status,
 		"responsetime": responseTime,
-        "src":          &src,
-        "dst":          &dst,
+		"src":          &src,
+		"dst":          &dst,
 		"tranCode": requ.cbodData["tranCode"],
 		"mfTranCode": requ.cbodData["mfTranCode"],
 		"retCode": resp.cbodData["retCode"],
-	}
-	
-	if resp.Ts.IsZero() {
-		event["respond_status"] = "FAIL"
-	}
 
-	if taicang.SendRequest {
-		event["request"] = string(taicang.cutMessageBody(requ))
-	}
-	if taicang.SendResponse {
-		event["response"] = string(taicang.cutMessageBody(resp))
-	}
-	if len(requ.Notes)+len(resp.Notes) > 0 {
-		event["notes"] = append(requ.Notes, resp.Notes...)
-	}
-	if len(requ.RealIP) > 0 {
-		event["real_ip"] = requ.RealIP
 	}
 
 	return event
 }
 
-func (taicang *Taicang) publishTransaction(event common.MapStr) {
+func (taicang *taicangPlugin) publishTransaction(event common.MapStr) {
 	if taicang.results == nil {
 		return
 	}
 	taicang.results.PublishTransaction(event)
 }
 
-func (taicang *Taicang) collectHeaders(m *message) interface{} {
-	if !taicang.SplitCookie {
-		return m.Headers
+func (taicang *taicangPlugin) RemovalListener(data protos.ProtocolData) {
+	if conn, ok := data.(*taicangConnectionData); ok {
+		if !conn.requests.empty() && conn.responses.empty() {
+			requ := conn.requests.pop()
+			resp := &message{
+				statusCode: 700,
+			}
+			result := taicang.newTransaction(requ, resp)
+			taicang.results.PublishTransaction(result)
+		}
+	} else {
+		logp.Warn("Not a taicangConnectionData")
 	}
+}
 
-	cookie := "cookie"
-	if !m.IsRequest {
-		cookie = "set-cookie"
-	}
+func (taicang *taicangPlugin) collectHeaders(m *message) interface{} {
 
 	hdrs := map[string]interface{}{}
-	for name, value := range m.Headers {
-		if name == cookie {
-			hdrs[name] = splitCookiesHeader(string(value))
-		} else {
-			hdrs[name] = value
+
+	hdrs["content-length"] = m.contentLength
+	if len(m.contentType) > 0 {
+		hdrs["content-type"] = m.contentType
+	}
+
+	if taicang.parserConfig.sendHeaders {
+
+		cookie := "cookie"
+		if !m.isRequest {
+			cookie = "set-cookie"
+		}
+
+		for name, value := range m.headers {
+			if strings.ToLower(name) == "content-type" {
+				continue
+			}
+			if strings.ToLower(name) == "content-length" {
+				continue
+			}
+			if taicang.splitCookie && name == cookie {
+				hdrs[name] = splitCookiesHeader(string(value))
+			} else {
+				hdrs[name] = value
+			}
 		}
 	}
 	return hdrs
+}
+
+func (taicang *taicangPlugin) setBody(result common.MapStr, m *message) {
+	body := string(taicang.extractBody(m))
+	if len(body) > 0 {
+		result["body"] = body
+	}
 }
 
 func splitCookiesHeader(headerVal string) map[string]string {
@@ -539,37 +534,58 @@ func parseCookieValue(raw string) string {
 	return raw
 }
 
-func (taicang *Taicang) cutMessageBody(m *message) []byte {
-	cutMsg := []byte{}
+func (taicang *taicangPlugin) extractBody(m *message) []byte {
+	body := []byte{}
 
-	// add headers always
-	cutMsg = m.Raw[:m.bodyOffset]
-
-	// add body
-	if len(m.ContentType) == 0 || taicang.shouldIncludeInBody(m.ContentType) {
+	if len(m.contentType) > 0 && taicang.shouldIncludeInBody(m.contentType) {
 		if len(m.chunkedBody) > 0 {
-			cutMsg = append(cutMsg, m.chunkedBody...)
+			body = append(body, m.chunkedBody...)
 		} else {
 			if isDebug {
-				debugf("Body to include: [%s]", m.Raw[m.bodyOffset:])
+				debugf("Body to include: [%s]", m.raw[m.bodyOffset:])
 			}
-			cutMsg = append(cutMsg, m.Raw[m.bodyOffset:]...)
+			body = append(body, m.raw[m.bodyOffset:]...)
 		}
 	}
 
-	return cutMsg
+	return body
 }
 
-func (taicang *Taicang) shouldIncludeInBody(contenttype []byte) bool {
+func (taicang *taicangPlugin) cutMessageBody(m *message) []byte {
+	cutMsg := []byte{}
+
+	// add headers always
+	cutMsg = m.raw[:m.bodyOffset]
+
+	// add body
+	return append(cutMsg, taicang.extractBody(m)...)
+
+}
+
+func (taicang *taicangPlugin) shouldIncludeInBody(contenttype []byte) bool {
+	includedBodies := taicang.includeBodyFor
+	for _, include := range includedBodies {
+		if bytes.Contains(contenttype, []byte(include)) {
+			if isDebug {
+				debugf("Should Include Body = true Content-Type %s include_body %s",
+					contenttype, include)
+			}
+			return true
+		}
+		if isDebug {
+			debugf("Should Include Body = false Content-Type %s include_body %s",
+				contenttype, include)
+		}
+	}
 	return false
 }
 
-func (taicang *Taicang) hideHeaders(m *message) {
-	if !m.IsRequest || !taicang.RedactAuthorization {
+func (taicang *taicangPlugin) hideHeaders(m *message) {
+	if !m.isRequest || !taicang.redactAuthorization {
 		return
 	}
 
-	msg := m.Raw
+	msg := m.raw
 
 	// byte64 != encryption, so obscure it in headers in case of Basic Authentication
 
@@ -611,15 +627,15 @@ func (taicang *Taicang) hideHeaders(m *message) {
 	}
 
 	for _, header := range redactHeaders {
-		if len(m.Headers[header]) > 0 {
-			m.Headers[header] = []byte("*")
+		if len(m.headers[header]) > 0 {
+			m.headers[header] = []byte("*")
 		}
 	}
 
-	m.Raw = msg
+	m.raw = msg
 }
 
-func (taicang *Taicang) hideSecrets(values url.Values) url.Values {
+func (taicang *taicangPlugin) hideSecrets(values url.Values) url.Values {
 	params := url.Values{}
 	for key, array := range values {
 		for _, value := range array {
@@ -635,11 +651,11 @@ func (taicang *Taicang) hideSecrets(values url.Values) url.Values {
 
 // extractParameters parses the URL and the form parameters and replaces the secrets
 // with the string xxxxx. The parameters containing secrets are defined in taicang.Hide_secrets.
-// Returns the Request URI path and the (ajdusted) parameters.
-func (taicang *Taicang) extractParameters(m *message, msg []byte) (path string, params string, err error) {
+// Returns the Request URI path and the (adjusted) parameters.
+func (taicang *taicangPlugin) extractParameters(m *message, msg []byte) (path string, params string, err error) {
 	var values url.Values
 
-	u, err := url.Parse(string(m.RequestURI))
+	u, err := url.Parse(string(m.requestURI))
 	if err != nil {
 		return
 	}
@@ -648,7 +664,8 @@ func (taicang *Taicang) extractParameters(m *message, msg []byte) (path string, 
 
 	paramsMap := taicang.hideSecrets(values)
 
-	if m.ContentLength > 0 && bytes.Contains(m.ContentType, []byte("urlencoded")) {
+	if m.contentLength > 0 && bytes.Contains(m.contentType, []byte("urlencoded")) {
+
 		values, err = url.ParseQuery(string(msg[m.bodyOffset:]))
 		if err != nil {
 			return
@@ -658,17 +675,16 @@ func (taicang *Taicang) extractParameters(m *message, msg []byte) (path string, 
 			paramsMap[key] = value
 		}
 	}
+
 	params = paramsMap.Encode()
-
 	if isDetailed {
-		detailedf("Parameters: %s", params)
+		detailedf("Form parameters: %s", params)
 	}
-
 	return
 }
 
-func (taicang *Taicang) isSecretParameter(key string) bool {
-	for _, keyword := range taicang.HideKeywords {
+func (taicang *taicangPlugin) isSecretParameter(key string) bool {
+	for _, keyword := range taicang.hideKeywords {
 		if strings.ToLower(key) == keyword {
 			return true
 		}

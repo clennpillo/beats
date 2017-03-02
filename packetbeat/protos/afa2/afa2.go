@@ -2,16 +2,15 @@ package afa2
 
 import (
 	"bytes"
+	"expvar"
 	"net/url"
 	"strings"
 	"time"
-	_ "fmt"
 	_ "strconv"
 
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
 
-	"github.com/elastic/beats/packetbeat/config"
 	"github.com/elastic/beats/packetbeat/procs"
 	"github.com/elastic/beats/packetbeat/protos"
 	"github.com/elastic/beats/packetbeat/protos/tcp"
@@ -33,8 +32,12 @@ const (
 	stateBodyChunkedWaitFinalCRLF
 )
 
+var (
+	unmatchedResponses = expvar.NewInt("afa2.unmatched_responses")
+)
+
 type stream struct {
-	tcptuple *common.TcpTuple
+	tcptuple *common.TCPTuple
 
 	data []byte
 
@@ -46,7 +49,7 @@ type stream struct {
 }
 
 type afa2ConnectionData struct {
-	Streams   [2]*stream
+	streams   [2]*stream
 	requests  messageList
 	responses messageList
 }
@@ -56,14 +59,16 @@ type messageList struct {
 }
 
 // afa2 application level protocol analyser plugin.
-type Afa2 struct {
+type afa2Plugin struct {
 	// config
-	Ports               []int
-	SendRequest         bool
-	SendResponse        bool
-	SplitCookie         bool
-	HideKeywords        []string
-	RedactAuthorization bool
+	ports               []int
+	sendRequest         bool
+	sendResponse        bool
+	splitCookie         bool
+	hideKeywords        []string
+	redactAuthorization bool
+	includeBodyFor      []string
+	maxMessageSize      int
 
 	parserConfig parserConfig
 
@@ -77,90 +82,76 @@ var (
 	isDetailed = false
 )
 
-func (afa2 *Afa2) initDefaults() {
-	afa2.SendRequest = false
-	afa2.SendResponse = false
-	afa2.RedactAuthorization = false
-	afa2.transactionTimeout = protos.DefaultTransactionExpiration
+func init() {
+	protos.Register("afa2", New)
 }
 
-func (afa2 *Afa2) setFromConfig(config config.Afa2) (err error) {
-
-	afa2.Ports = config.Ports
-
-	if config.SendRequest != nil {
-		afa2.SendRequest = *config.SendRequest
-	}
-	if config.SendResponse != nil {
-		afa2.SendResponse = *config.SendResponse
-	}
-
-	if config.TransactionTimeout != nil && *config.TransactionTimeout > 0 {
-		afa2.transactionTimeout = time.Duration(*config.TransactionTimeout) * time.Second
-	}
-
-	return nil
-}
-
-// GetPorts lists the port numbers the Afa2 protocol analyser will handle.
-func (afa2 *Afa2) GetPorts() []int {
-	return afa2.Ports
-}
-
-// Init initializes the Afa2 protocol analyser.
-func (afa2 *Afa2) Init(testMode bool, results publish.Transactions) error {
-	afa2.initDefaults()
-
+func New(
+	testMode bool,
+	results publish.Transactions, 
+	cfg *common.Config,
+) (protos.Plugin, error) {
+	p := &afa2Plugin{}
+	config := defaultConfig
 	if !testMode {
-		err := afa2.setFromConfig(config.ConfigSingleton.Protocols.Afa2)
-		if err != nil {
-			return err
+		if err := cfg.Unpack(&config); err != nil {
+			return nil, err
 		}
 	}
 
+	if err := p.init(results, &config); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// Init initializes the afa2 protocol analyser.
+func (afa2 *afa2Plugin) init(results publish.Transactions, config *afa2Config) error {
+	afa2.setFromConfig(config)
+
 	isDebug = logp.IsDebug("afa2")
 	isDetailed = logp.IsDebug("afa2detailed")
-
 	afa2.results = results
-
 	return nil
+}
+
+func (afa2 *afa2Plugin) setFromConfig(config *afa2Config) {
+	afa2.ports = config.Ports
+	afa2.sendRequest = config.SendRequest
+	afa2.sendResponse = config.SendResponse
+	afa2.hideKeywords = config.HideKeywords
+	afa2.redactAuthorization = config.RedactAuthorization
+	afa2.splitCookie = config.SplitCookie
+	afa2.parserConfig.realIPHeader = strings.ToLower(config.RealIPHeader)
+	afa2.transactionTimeout = config.TransactionTimeout
+	afa2.includeBodyFor = config.IncludeBodyFor
+	afa2.maxMessageSize = config.MaxMessageSize
+
+	if config.SendAllHeaders {
+		afa2.parserConfig.sendHeaders = true
+		afa2.parserConfig.sendAllHeaders = true
+	} else {
+		if len(config.SendHeaders) > 0 {
+			afa2.parserConfig.sendHeaders = true
+
+			afa2.parserConfig.headersWhitelist = map[string]bool{}
+			for _, hdr := range config.SendHeaders {
+				afa2.parserConfig.headersWhitelist[strings.ToLower(hdr)] = true
+			}
+		}
+	}
+}
+
+// GetPorts lists the port numbers the afa2 protocol analyser will handle.
+func (afa2 *afa2Plugin) GetPorts() []int {
+	return afa2.ports
 }
 
 // messageGap is called when a gap of size `nbytes` is found in the
 // tcp stream. Decides if we can ignore the gap or it's a parser error
 // and we need to drop the stream.
-func (afa2 *Afa2) messageGap(s *stream, nbytes int) (ok bool, complete bool) {
-
-	m := s.message
-	switch s.parseState {
-	case stateStart, stateHeaders:
-		// we know we cannot recover from these
-		return false, false
-	case stateBody:
-		if isDebug {
-			debugf("gap in body: %d", nbytes)
-		}
-
-		if m.IsRequest {
-			m.Notes = append(m.Notes, "Packet loss while capturing the request")
-		} else {
-			m.Notes = append(m.Notes, "Packet loss while capturing the response")
-		}
-		if !m.hasContentLength && (bytes.Equal(m.connection, constClose) ||
-			(isVersion(m.version, 1, 0) && !bytes.Equal(m.connection, constKeepAlive))) {
-
-			s.bodyReceived += nbytes
-			m.ContentLength += nbytes
-			return true, false
-		} else if len(s.data[s.parseOffset:])+nbytes >= m.ContentLength-s.bodyReceived {
-			// we're done, but the last portion of the data is gone
-			m.end = s.parseOffset
-			return true, true
-		} else {
-			s.bodyReceived += nbytes
-			return true, false
-		}
-	}
+func (afa2 *afa2Plugin) messageGap(s *stream, nbytes int) (ok bool, complete bool) {
+	
 	// assume we cannot recover
 	return false, false
 }
@@ -175,26 +166,26 @@ func (st *stream) PrepareForNewMessage() {
 
 // Called when the parser has identified the boundary
 // of a message.
-func (afa2 *Afa2) messageComplete(
+func (afa2 *afa2Plugin) messageComplete(
 	conn *afa2ConnectionData,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 	st *stream,
 ) {
-	st.message.Raw = st.data[st.message.start:st.message.end]
+	st.message.raw = st.data[st.message.start:st.message.end]
 
 	afa2.handleAfa2(conn, st.message, tcptuple, dir)
 }
 
-// ConnectionTimeout returns the configured Afa2 transaction timeout.
-func (afa2 *Afa2) ConnectionTimeout() time.Duration {
+// ConnectionTimeout returns the configured afa2 transaction timeout.
+func (afa2 *afa2Plugin) ConnectionTimeout() time.Duration {
 	return afa2.transactionTimeout
 }
 
 // Parse function is used to process TCP payloads.
-func (afa2 *Afa2) Parse(
+func (afa2 *afa2Plugin) Parse(
 	pkt *protos.Packet,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 	private protos.ProtocolData,
 ) protos.ProtocolData {
@@ -235,10 +226,10 @@ func getAfa2Connection(private protos.ProtocolData) *afa2ConnectionData {
 }
 
 // Parse function is used to process TCP payloads.
-func (afa2 *Afa2) doParse(
+func (afa2 *afa2Plugin) doParse(
 	conn *afa2ConnectionData,
 	pkt *protos.Packet,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 ) *afa2ConnectionData {
 
@@ -246,33 +237,35 @@ func (afa2 *Afa2) doParse(
 		detailedf("Payload received: [%s]", pkt.Payload)
 	}
 
-	st := conn.Streams[dir]
+	extraMsgSize := 0 // size of a "seen" packet for which we don't store the actual bytes
+
+	st := conn.streams[dir]
 	if st == nil {
 		st = newStream(pkt, tcptuple)
-		conn.Streams[dir] = st
+		conn.streams[dir] = st
 	} else {
 		// concatenate bytes
-		st.data = append(st.data, pkt.Payload...)
-		if len(st.data) > tcp.TCP_MAX_DATA_IN_STREAM {
+		if len(st.data)+len(pkt.Payload) > afa2.maxMessageSize {
 			if isDebug {
-				debugf("Stream data too large, dropping TCP stream")
+				debugf("Stream data too large, ignoring message")
 			}
-			conn.Streams[dir] = nil
-			return conn
+			extraMsgSize = len(pkt.Payload)
+		} else {
+			st.data = append(st.data, pkt.Payload...)
 		}
 	}
 
 	for len(st.data) > 0 {
 		if st.message == nil {
-			st.message = &message{Ts: pkt.Ts}
+			st.message = &message{ts: pkt.Ts}
 		}
 
 		parser := newParser(&afa2.parserConfig)
-		ok, complete := parser.parse(st)
+		ok, complete := parser.parse(st, extraMsgSize)
 		if !ok {
 			// drop this tcp stream. Will retry parsing with the next
 			// segment in it
-			conn.Streams[dir] = nil
+			conn.streams[dir] = nil
 			return conn
 		}
 
@@ -284,43 +277,38 @@ func (afa2 *Afa2) doParse(
 		// all ok, ship it
 		afa2.messageComplete(conn, tcptuple, dir, st)
 
-		debugf("message complete")
-		
 		// and reset stream for next message
 		st.PrepareForNewMessage()
-		
-		debugf("prepare new")
 	}
 
 	return conn
 }
 
-func newStream(pkt *protos.Packet, tcptuple *common.TcpTuple) *stream {
+func newStream(pkt *protos.Packet, tcptuple *common.TCPTuple) *stream {
 	return &stream{
 		tcptuple: tcptuple,
 		data:     pkt.Payload,
-		message:  &message{Ts: pkt.Ts},
+		message:  &message{ts: pkt.Ts},
 	}
 }
 
 // ReceivedFin will be called when TCP transaction is terminating.
-func (afa2 *Afa2) ReceivedFin(tcptuple *common.TcpTuple, dir uint8,
+func (afa2 *afa2Plugin) ReceivedFin(tcptuple *common.TCPTuple, dir uint8,
 	private protos.ProtocolData) protos.ProtocolData {
 
+	debugf("Received FIN")
 	conn := getAfa2Connection(private)
 	if conn == nil {
 		return private
 	}
 
-	stream := conn.Streams[dir]
+	stream := conn.streams[dir]
 	if stream == nil {
 		return conn
 	}
 
-	// send whatever data we got so far as complete. This
-	// is needed for the Afa2/1.0 without Content-Length situation.
 	if stream.message != nil && len(stream.data[stream.message.start:]) > 0 {
-		stream.message.Raw = stream.data[stream.message.start:]
+		stream.message.raw = stream.data[stream.message.start:]
 		afa2.handleAfa2(conn, stream.message, tcptuple, dir)
 
 		// and reset message. Probably not needed, just to be sure.
@@ -332,7 +320,7 @@ func (afa2 *Afa2) ReceivedFin(tcptuple *common.TcpTuple, dir uint8,
 
 // GapInStream is called when a gap of nbytes bytes is found in the stream (due
 // to packet loss).
-func (afa2 *Afa2) GapInStream(tcptuple *common.TcpTuple, dir uint8,
+func (afa2 *afa2Plugin) GapInStream(tcptuple *common.TCPTuple, dir uint8,
 	nbytes int, private protos.ProtocolData) (priv protos.ProtocolData, drop bool) {
 
 	defer logp.Recover("GapInStream(afa2) exception")
@@ -342,7 +330,7 @@ func (afa2 *Afa2) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 		return private, false
 	}
 
-	stream := conn.Streams[dir]
+	stream := conn.streams[dir]
 	if stream == nil || stream.message == nil {
 		// nothing to do
 		return private, false
@@ -354,7 +342,7 @@ func (afa2 *Afa2) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	}
 	if !ok {
 		// on errors, drop stream
-		conn.Streams[dir] = nil
+		conn.streams[dir] = nil
 		return conn, true
 	}
 
@@ -367,52 +355,43 @@ func (afa2 *Afa2) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	return private, false
 }
 
-func (afa2 *Afa2) RemovalListener(data protos.ProtocolData) {
-	if conn, ok := data.(*afa2ConnectionData); ok {
-		if !conn.requests.empty() && conn.responses.empty() {
-			requ := conn.requests.pop()
-			resp := &message{
-				StatusCode: 700,
-			}
-			result := afa2.newTransaction(requ, resp)
-			afa2.results.PublishTransaction(result)
-		}
-	} else {
-		logp.Warn("Not a afa2ConnectionData")
-	}
-}
-
-func (afa2 *Afa2) handleAfa2(
+func (afa2 *afa2Plugin) handleAfa2(
 	conn *afa2ConnectionData,
 	m *message,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 ) {
 
-	m.TCPTuple = *tcptuple
-	m.Direction = dir
-	m.CmdlineTuple = procs.ProcWatcher.FindProcessesTuple(tcptuple.IpPort())
+	m.tcpTuple = *tcptuple
+	m.direction = dir
+	m.cmdlineTuple = procs.ProcWatcher.FindProcessesTuple(tcptuple.IPPort())
 	afa2.hideHeaders(m)
 
-	if m.IsRequest {
+	if m.isRequest {
 		if isDebug {
-			debugf("Received request with tuple: %s", m.TCPTuple)
+			debugf("Received request with tuple: %s", m.tcpTuple)
+		}
+		if conn.requests.tail != nil {
+			for !conn.requests.empty() {
+				conn.requests.pop()
+			}
 		}
 		conn.requests.append(m)
 	} else {
 		if isDebug {
-			debugf("Received response with tuple: %s", m.TCPTuple)
+			debugf("Received response with tuple: %s", m.tcpTuple)
 		}
 		conn.responses.append(m)
 		afa2.correlate(conn)
 	}
 }
 
-func (afa2 *Afa2) correlate(conn *afa2ConnectionData) {
+func (afa2 *afa2Plugin) correlate(conn *afa2ConnectionData) {
 	// drop responses with missing requests
 	if conn.requests.empty() {
 		for !conn.responses.empty() {
-			logp.Warn("Response from unknown transaction. Ingoring.")
+			debugf("Response from unknown transaction. Ingoring.")
+			unmatchedResponses.Add(1)
 			conn.responses.pop()
 		}
 		return
@@ -425,95 +404,110 @@ func (afa2 *Afa2) correlate(conn *afa2ConnectionData) {
 		trans := afa2.newTransaction(requ, resp)
 
 		if isDebug {
-			debugf("Afa2 transaction completed")
+			debugf("afa2 transaction completed")
 		}
 		afa2.publishTransaction(trans)
 	}
 }
 
-func (afa2 *Afa2) newTransaction(requ, resp *message) common.MapStr {
+func (afa2 *afa2Plugin) newTransaction(requ, resp *message) common.MapStr {
 	status := common.OK_STATUS
-	if resp.StatusCode >= 400 {
+	if resp.statusCode >= 400 {
 		status = common.ERROR_STATUS
 	}
 
 	// resp_time in milliseconds
-	responseTime := int32(resp.Ts.Sub(requ.Ts).Nanoseconds() / 1e6)
+	responseTime := int32(resp.ts.Sub(requ.ts).Nanoseconds() / 1e6)
 
 	src := common.Endpoint{
-		Ip:   requ.TCPTuple.Src_ip.String(),
-		Port: requ.TCPTuple.Src_port,
-		Proc: string(requ.CmdlineTuple.Src),
+		IP:   requ.tcpTuple.SrcIP.String(),
+		Port: requ.tcpTuple.SrcPort,
+		Proc: string(requ.cmdlineTuple.Src),
 	}
 	dst := common.Endpoint{
-		Ip:   requ.TCPTuple.Dst_ip.String(),
-		Port: requ.TCPTuple.Dst_port,
-		Proc: string(requ.CmdlineTuple.Dst),
+		IP:   requ.tcpTuple.DstIP.String(),
+		Port: requ.tcpTuple.DstPort,
+		Proc: string(requ.cmdlineTuple.Dst),
 	}
-	if requ.Direction == tcp.TcpDirectionReverse {
+	if requ.direction == tcp.TCPDirectionReverse {
 		src, dst = dst, src
 	}
 
-	ts := requ.Ts
-
 	event := common.MapStr{
-		"@timestamp":   common.Time(ts),
-		"status":       status,
+		"@timestamp":   common.Time(requ.ts),
 		"type":         "afa2",
+		"status":       status,
 		"responsetime": responseTime,
-        "src":          &src,
-        "dst":          &dst,
+		"src":          &src,
+		"dst":          &dst,
 		"tranCode": requ.tranCode,
 		"templateCode": requ.templateCode,
 		"retCode": resp.retCode,
-	}
-	
-	if resp.Ts.IsZero() {
-		event["respond_status"] = "FAIL"
-	}
-
-	if afa2.SendRequest {
-		event["request"] = string(afa2.cutMessageBody(requ))
-	}
-	if afa2.SendResponse {
-		event["response"] = string(afa2.cutMessageBody(resp))
-	}
-	if len(requ.Notes)+len(resp.Notes) > 0 {
-		event["notes"] = append(requ.Notes, resp.Notes...)
-	}
-	if len(requ.RealIP) > 0 {
-		event["real_ip"] = requ.RealIP
 	}
 
 	return event
 }
 
-func (afa2 *Afa2) publishTransaction(event common.MapStr) {
+func (afa2 *afa2Plugin) publishTransaction(event common.MapStr) {
 	if afa2.results == nil {
 		return
 	}
 	afa2.results.PublishTransaction(event)
 }
 
-func (afa2 *Afa2) collectHeaders(m *message) interface{} {
-	if !afa2.SplitCookie {
-		return m.Headers
+func (afa2 *afa2Plugin) RemovalListener(data protos.ProtocolData) {
+	if conn, ok := data.(*afa2ConnectionData); ok {
+		if !conn.requests.empty() && conn.responses.empty() {
+			requ := conn.requests.pop()
+			resp := &message{
+				statusCode: 700,
+			}
+			result := afa2.newTransaction(requ, resp)
+			afa2.results.PublishTransaction(result)
+		}
+	} else {
+		logp.Warn("Not a afa2ConnectionData")
 	}
+}
 
-	cookie := "cookie"
-	if !m.IsRequest {
-		cookie = "set-cookie"
-	}
+func (afa2 *afa2Plugin) collectHeaders(m *message) interface{} {
 
 	hdrs := map[string]interface{}{}
-	for name, value := range m.Headers {
-		if name == cookie {
-			hdrs[name] = splitCookiesHeader(string(value))
-		} else {
-			hdrs[name] = value
+
+	hdrs["content-length"] = m.contentLength
+	if len(m.contentType) > 0 {
+		hdrs["content-type"] = m.contentType
+	}
+
+	if afa2.parserConfig.sendHeaders {
+
+		cookie := "cookie"
+		if !m.isRequest {
+			cookie = "set-cookie"
+		}
+
+		for name, value := range m.headers {
+			if strings.ToLower(name) == "content-type" {
+				continue
+			}
+			if strings.ToLower(name) == "content-length" {
+				continue
+			}
+			if afa2.splitCookie && name == cookie {
+				hdrs[name] = splitCookiesHeader(string(value))
+			} else {
+				hdrs[name] = value
+			}
 		}
 	}
 	return hdrs
+}
+
+func (afa2 *afa2Plugin) setBody(result common.MapStr, m *message) {
+	body := string(afa2.extractBody(m))
+	if len(body) > 0 {
+		result["body"] = body
+	}
 }
 
 func splitCookiesHeader(headerVal string) map[string]string {
@@ -539,37 +533,58 @@ func parseCookieValue(raw string) string {
 	return raw
 }
 
-func (afa2 *Afa2) cutMessageBody(m *message) []byte {
-	cutMsg := []byte{}
+func (afa2 *afa2Plugin) extractBody(m *message) []byte {
+	body := []byte{}
 
-	// add headers always
-	cutMsg = m.Raw[:m.bodyOffset]
-
-	// add body
-	if len(m.ContentType) == 0 || afa2.shouldIncludeInBody(m.ContentType) {
+	if len(m.contentType) > 0 && afa2.shouldIncludeInBody(m.contentType) {
 		if len(m.chunkedBody) > 0 {
-			cutMsg = append(cutMsg, m.chunkedBody...)
+			body = append(body, m.chunkedBody...)
 		} else {
 			if isDebug {
-				debugf("Body to include: [%s]", m.Raw[m.bodyOffset:])
+				debugf("Body to include: [%s]", m.raw[m.bodyOffset:])
 			}
-			cutMsg = append(cutMsg, m.Raw[m.bodyOffset:]...)
+			body = append(body, m.raw[m.bodyOffset:]...)
 		}
 	}
 
-	return cutMsg
+	return body
 }
 
-func (afa2 *Afa2) shouldIncludeInBody(contenttype []byte) bool {
+func (afa2 *afa2Plugin) cutMessageBody(m *message) []byte {
+	cutMsg := []byte{}
+
+	// add headers always
+	cutMsg = m.raw[:m.bodyOffset]
+
+	// add body
+	return append(cutMsg, afa2.extractBody(m)...)
+
+}
+
+func (afa2 *afa2Plugin) shouldIncludeInBody(contenttype []byte) bool {
+	includedBodies := afa2.includeBodyFor
+	for _, include := range includedBodies {
+		if bytes.Contains(contenttype, []byte(include)) {
+			if isDebug {
+				debugf("Should Include Body = true Content-Type %s include_body %s",
+					contenttype, include)
+			}
+			return true
+		}
+		if isDebug {
+			debugf("Should Include Body = false Content-Type %s include_body %s",
+				contenttype, include)
+		}
+	}
 	return false
 }
 
-func (afa2 *Afa2) hideHeaders(m *message) {
-	if !m.IsRequest || !afa2.RedactAuthorization {
+func (afa2 *afa2Plugin) hideHeaders(m *message) {
+	if !m.isRequest || !afa2.redactAuthorization {
 		return
 	}
 
-	msg := m.Raw
+	msg := m.raw
 
 	// byte64 != encryption, so obscure it in headers in case of Basic Authentication
 
@@ -611,15 +626,15 @@ func (afa2 *Afa2) hideHeaders(m *message) {
 	}
 
 	for _, header := range redactHeaders {
-		if len(m.Headers[header]) > 0 {
-			m.Headers[header] = []byte("*")
+		if len(m.headers[header]) > 0 {
+			m.headers[header] = []byte("*")
 		}
 	}
 
-	m.Raw = msg
+	m.raw = msg
 }
 
-func (afa2 *Afa2) hideSecrets(values url.Values) url.Values {
+func (afa2 *afa2Plugin) hideSecrets(values url.Values) url.Values {
 	params := url.Values{}
 	for key, array := range values {
 		for _, value := range array {
@@ -635,11 +650,11 @@ func (afa2 *Afa2) hideSecrets(values url.Values) url.Values {
 
 // extractParameters parses the URL and the form parameters and replaces the secrets
 // with the string xxxxx. The parameters containing secrets are defined in afa2.Hide_secrets.
-// Returns the Request URI path and the (ajdusted) parameters.
-func (afa2 *Afa2) extractParameters(m *message, msg []byte) (path string, params string, err error) {
+// Returns the Request URI path and the (adjusted) parameters.
+func (afa2 *afa2Plugin) extractParameters(m *message, msg []byte) (path string, params string, err error) {
 	var values url.Values
 
-	u, err := url.Parse(string(m.RequestURI))
+	u, err := url.Parse(string(m.requestURI))
 	if err != nil {
 		return
 	}
@@ -648,7 +663,8 @@ func (afa2 *Afa2) extractParameters(m *message, msg []byte) (path string, params
 
 	paramsMap := afa2.hideSecrets(values)
 
-	if m.ContentLength > 0 && bytes.Contains(m.ContentType, []byte("urlencoded")) {
+	if m.contentLength > 0 && bytes.Contains(m.contentType, []byte("urlencoded")) {
+
 		values, err = url.ParseQuery(string(msg[m.bodyOffset:]))
 		if err != nil {
 			return
@@ -658,17 +674,16 @@ func (afa2 *Afa2) extractParameters(m *message, msg []byte) (path string, params
 			paramsMap[key] = value
 		}
 	}
+
 	params = paramsMap.Encode()
-
 	if isDetailed {
-		detailedf("Parameters: %s", params)
+		detailedf("Form parameters: %s", params)
 	}
-
 	return
 }
 
-func (afa2 *Afa2) isSecretParameter(key string) bool {
-	for _, keyword := range afa2.HideKeywords {
+func (afa2 *afa2Plugin) isSecretParameter(key string) bool {
+	for _, keyword := range afa2.hideKeywords {
 		if strings.ToLower(key) == keyword {
 			return true
 		}

@@ -389,21 +389,6 @@ func (http *httpPlugin) GapInStream(tcptuple *common.TCPTuple, dir uint8,
 	return private, false
 }
 
-func (http *HTTP) RemovalListener(data protos.ProtocolData) {
-	if conn, ok := data.(*httpConnectionData); ok {
-		if !conn.requests.empty() && conn.responses.empty() {
-			requ := conn.requests.pop()
-			resp := &message{
-				StatusCode: 700,
-			}
-			result := http.newTransaction(requ, resp)
-			http.results.PublishTransaction(result)
-		}
-	} else {
-		logp.Warn("Not a httpConnectionData")
-	}
-}
-
 func (http *httpPlugin) handleHTTP(
 	conn *httpConnectionData,
 	m *message,
@@ -512,9 +497,9 @@ func (http *httpPlugin) newTransaction(requ, resp *message) common.MapStr {
 		"dst":          &dst,
 	}
 	
-	if resp.Ts.IsZero() {
-		event["respond_status"] = "FAIL"
-	}
+	//if resp.Ts.IsZero() {
+	//	event["respond_status"] = "FAIL"
+	//}
 
 	if http.sendRequest {
 		event["request"] = string(http.cutMessageBody(requ))
@@ -538,6 +523,21 @@ func (http *httpPlugin) publishTransaction(event common.MapStr) {
 		return
 	}
 	http.results.PublishTransaction(event)
+}
+
+func (http *httpPlugin) RemovalListener(data protos.ProtocolData) {
+	if conn, ok := data.(*httpConnectionData); ok {
+		if !conn.requests.empty() && conn.responses.empty() {
+			requ := conn.requests.pop()
+			resp := &message{
+				statusCode: 700,
+			}
+			result := http.newTransaction(requ, resp)
+			http.results.PublishTransaction(result)
+		}
+	} else {
+		logp.Warn("Not a httpConnectionData")
+	}
 }
 
 func (http *httpPlugin) collectHeaders(m *message) interface{} {

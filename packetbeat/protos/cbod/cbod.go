@@ -2,16 +2,15 @@ package cbod
 
 import (
 	"bytes"
+	"expvar"
 	"net/url"
 	"strings"
 	"time"
-	_ "fmt"
 	_ "strconv"
 
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
 
-	"github.com/elastic/beats/packetbeat/config"
 	"github.com/elastic/beats/packetbeat/procs"
 	"github.com/elastic/beats/packetbeat/protos"
 	"github.com/elastic/beats/packetbeat/protos/tcp"
@@ -33,8 +32,12 @@ const (
 	stateBodyChunkedWaitFinalCRLF
 )
 
+var (
+	unmatchedResponses = expvar.NewInt("cbod.unmatched_responses")
+)
+
 type stream struct {
-	tcptuple *common.TcpTuple
+	tcptuple *common.TCPTuple
 
 	data []byte
 
@@ -46,7 +49,7 @@ type stream struct {
 }
 
 type cbodConnectionData struct {
-	Streams   [2]*stream
+	streams   [2]*stream
 	requests  messageList
 	responses messageList
 }
@@ -55,15 +58,17 @@ type messageList struct {
 	head, tail *message
 }
 
-// cbod application level protocol analyser plugin.
-type Cbod struct {
+// Cbod application level protocol analyser plugin.
+type cbodPlugin struct {
 	// config
-	Ports               []int
-	SendRequest         bool
-	SendResponse        bool
-	SplitCookie         bool
-	HideKeywords        []string
-	RedactAuthorization bool
+	ports               []int
+	sendRequest         bool
+	sendResponse        bool
+	splitCookie         bool
+	hideKeywords        []string
+	redactAuthorization bool
+	includeBodyFor      []string
+	maxMessageSize      int
 
 	parserConfig parserConfig
 
@@ -77,90 +82,76 @@ var (
 	isDetailed = false
 )
 
-func (cbod *Cbod) initDefaults() {
-	cbod.SendRequest = false
-	cbod.SendResponse = false
-	cbod.RedactAuthorization = false
-	cbod.transactionTimeout = protos.DefaultTransactionExpiration
+func init() {
+	protos.Register("cbod", New)
 }
 
-func (cbod *Cbod) setFromConfig(config config.Cbod) (err error) {
-
-	cbod.Ports = config.Ports
-
-	if config.SendRequest != nil {
-		cbod.SendRequest = *config.SendRequest
-	}
-	if config.SendResponse != nil {
-		cbod.SendResponse = *config.SendResponse
-	}
-
-	if config.TransactionTimeout != nil && *config.TransactionTimeout > 0 {
-		cbod.transactionTimeout = time.Duration(*config.TransactionTimeout) * time.Second
-	}
-
-	return nil
-}
-
-// GetPorts lists the port numbers the Cbod protocol analyser will handle.
-func (cbod *Cbod) GetPorts() []int {
-	return cbod.Ports
-}
-
-// Init initializes the Cbod protocol analyser.
-func (cbod *Cbod) Init(testMode bool, results publish.Transactions) error {
-	cbod.initDefaults()
-
+func New(
+	testMode bool,
+	results publish.Transactions, 
+	cfg *common.Config,
+) (protos.Plugin, error) {
+	p := &cbodPlugin{}
+	config := defaultConfig
 	if !testMode {
-		err := cbod.setFromConfig(config.ConfigSingleton.Protocols.Cbod)
-		if err != nil {
-			return err
+		if err := cfg.Unpack(&config); err != nil {
+			return nil, err
 		}
 	}
 
+	if err := p.init(results, &config); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// Init initializes the Cbod protocol analyser.
+func (cbod *cbodPlugin) init(results publish.Transactions, config *cbodConfig) error {
+	cbod.setFromConfig(config)
+
 	isDebug = logp.IsDebug("cbod")
 	isDetailed = logp.IsDebug("cboddetailed")
-
 	cbod.results = results
-
 	return nil
+}
+
+func (cbod *cbodPlugin) setFromConfig(config *cbodConfig) {
+	cbod.ports = config.Ports
+	cbod.sendRequest = config.SendRequest
+	cbod.sendResponse = config.SendResponse
+	cbod.hideKeywords = config.HideKeywords
+	cbod.redactAuthorization = config.RedactAuthorization
+	cbod.splitCookie = config.SplitCookie
+	cbod.parserConfig.realIPHeader = strings.ToLower(config.RealIPHeader)
+	cbod.transactionTimeout = config.TransactionTimeout
+	cbod.includeBodyFor = config.IncludeBodyFor
+	cbod.maxMessageSize = config.MaxMessageSize
+
+	if config.SendAllHeaders {
+		cbod.parserConfig.sendHeaders = true
+		cbod.parserConfig.sendAllHeaders = true
+	} else {
+		if len(config.SendHeaders) > 0 {
+			cbod.parserConfig.sendHeaders = true
+
+			cbod.parserConfig.headersWhitelist = map[string]bool{}
+			for _, hdr := range config.SendHeaders {
+				cbod.parserConfig.headersWhitelist[strings.ToLower(hdr)] = true
+			}
+		}
+	}
+}
+
+// GetPorts lists the port numbers the Cbod protocol analyser will handle.
+func (cbod *cbodPlugin) GetPorts() []int {
+	return cbod.ports
 }
 
 // messageGap is called when a gap of size `nbytes` is found in the
 // tcp stream. Decides if we can ignore the gap or it's a parser error
 // and we need to drop the stream.
-func (cbod *Cbod) messageGap(s *stream, nbytes int) (ok bool, complete bool) {
-
-	m := s.message
-	switch s.parseState {
-	case stateStart, stateHeaders:
-		// we know we cannot recover from these
-		return false, false
-	case stateBody:
-		if isDebug {
-			debugf("gap in body: %d", nbytes)
-		}
-
-		if m.IsRequest {
-			m.Notes = append(m.Notes, "Packet loss while capturing the request")
-		} else {
-			m.Notes = append(m.Notes, "Packet loss while capturing the response")
-		}
-		if !m.hasContentLength && (bytes.Equal(m.connection, constClose) ||
-			(isVersion(m.version, 1, 0) && !bytes.Equal(m.connection, constKeepAlive))) {
-
-			s.bodyReceived += nbytes
-			m.ContentLength += nbytes
-			return true, false
-		} else if len(s.data[s.parseOffset:])+nbytes >= m.ContentLength-s.bodyReceived {
-			// we're done, but the last portion of the data is gone
-			m.end = s.parseOffset
-			return true, true
-		} else {
-			s.bodyReceived += nbytes
-			return true, false
-		}
-	}
+func (cbod *cbodPlugin) messageGap(s *stream, nbytes int) (ok bool, complete bool) {
+	
 	// assume we cannot recover
 	return false, false
 }
@@ -175,26 +166,26 @@ func (st *stream) PrepareForNewMessage() {
 
 // Called when the parser has identified the boundary
 // of a message.
-func (cbod *Cbod) messageComplete(
+func (cbod *cbodPlugin) messageComplete(
 	conn *cbodConnectionData,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 	st *stream,
 ) {
-	st.message.Raw = st.data[st.message.start:st.message.end]
+	st.message.raw = st.data[st.message.start:st.message.end]
 
 	cbod.handleCbod(conn, st.message, tcptuple, dir)
 }
 
 // ConnectionTimeout returns the configured Cbod transaction timeout.
-func (cbod *Cbod) ConnectionTimeout() time.Duration {
+func (cbod *cbodPlugin) ConnectionTimeout() time.Duration {
 	return cbod.transactionTimeout
 }
 
 // Parse function is used to process TCP payloads.
-func (cbod *Cbod) Parse(
+func (cbod *cbodPlugin) Parse(
 	pkt *protos.Packet,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 	private protos.ProtocolData,
 ) protos.ProtocolData {
@@ -235,10 +226,10 @@ func getCbodConnection(private protos.ProtocolData) *cbodConnectionData {
 }
 
 // Parse function is used to process TCP payloads.
-func (cbod *Cbod) doParse(
+func (cbod *cbodPlugin) doParse(
 	conn *cbodConnectionData,
 	pkt *protos.Packet,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 ) *cbodConnectionData {
 
@@ -246,33 +237,35 @@ func (cbod *Cbod) doParse(
 		detailedf("Payload received: [%s]", pkt.Payload)
 	}
 
-	st := conn.Streams[dir]
+	extraMsgSize := 0 // size of a "seen" packet for which we don't store the actual bytes
+
+	st := conn.streams[dir]
 	if st == nil {
 		st = newStream(pkt, tcptuple)
-		conn.Streams[dir] = st
+		conn.streams[dir] = st
 	} else {
 		// concatenate bytes
-		st.data = append(st.data, pkt.Payload...)
-		if len(st.data) > tcp.TCP_MAX_DATA_IN_STREAM {
+		if len(st.data)+len(pkt.Payload) > cbod.maxMessageSize {
 			if isDebug {
-				debugf("Stream data too large, dropping TCP stream")
+				debugf("Stream data too large, ignoring message")
 			}
-			conn.Streams[dir] = nil
-			return conn
+			extraMsgSize = len(pkt.Payload)
+		} else {
+			st.data = append(st.data, pkt.Payload...)
 		}
 	}
 
 	for len(st.data) > 0 {
 		if st.message == nil {
-			st.message = &message{Ts: pkt.Ts}
+			st.message = &message{ts: pkt.Ts}
 		}
 
 		parser := newParser(&cbod.parserConfig)
-		ok, complete := parser.parse(st)
+		ok, complete := parser.parse(st, extraMsgSize)
 		if !ok {
 			// drop this tcp stream. Will retry parsing with the next
 			// segment in it
-			conn.Streams[dir] = nil
+			conn.streams[dir] = nil
 			return conn
 		}
 
@@ -284,43 +277,38 @@ func (cbod *Cbod) doParse(
 		// all ok, ship it
 		cbod.messageComplete(conn, tcptuple, dir, st)
 
-		debugf("message complete")
-		
 		// and reset stream for next message
 		st.PrepareForNewMessage()
-		
-		debugf("prepare new")
 	}
 
 	return conn
 }
 
-func newStream(pkt *protos.Packet, tcptuple *common.TcpTuple) *stream {
+func newStream(pkt *protos.Packet, tcptuple *common.TCPTuple) *stream {
 	return &stream{
 		tcptuple: tcptuple,
 		data:     pkt.Payload,
-		message:  &message{Ts: pkt.Ts},
+		message:  &message{ts: pkt.Ts},
 	}
 }
 
 // ReceivedFin will be called when TCP transaction is terminating.
-func (cbod *Cbod) ReceivedFin(tcptuple *common.TcpTuple, dir uint8,
+func (cbod *cbodPlugin) ReceivedFin(tcptuple *common.TCPTuple, dir uint8,
 	private protos.ProtocolData) protos.ProtocolData {
 
+	debugf("Received FIN")
 	conn := getCbodConnection(private)
 	if conn == nil {
 		return private
 	}
 
-	stream := conn.Streams[dir]
+	stream := conn.streams[dir]
 	if stream == nil {
 		return conn
 	}
 
-	// send whatever data we got so far as complete. This
-	// is needed for the Cbod/1.0 without Content-Length situation.
 	if stream.message != nil && len(stream.data[stream.message.start:]) > 0 {
-		stream.message.Raw = stream.data[stream.message.start:]
+		stream.message.raw = stream.data[stream.message.start:]
 		cbod.handleCbod(conn, stream.message, tcptuple, dir)
 
 		// and reset message. Probably not needed, just to be sure.
@@ -332,7 +320,7 @@ func (cbod *Cbod) ReceivedFin(tcptuple *common.TcpTuple, dir uint8,
 
 // GapInStream is called when a gap of nbytes bytes is found in the stream (due
 // to packet loss).
-func (cbod *Cbod) GapInStream(tcptuple *common.TcpTuple, dir uint8,
+func (cbod *cbodPlugin) GapInStream(tcptuple *common.TCPTuple, dir uint8,
 	nbytes int, private protos.ProtocolData) (priv protos.ProtocolData, drop bool) {
 
 	defer logp.Recover("GapInStream(cbod) exception")
@@ -342,7 +330,7 @@ func (cbod *Cbod) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 		return private, false
 	}
 
-	stream := conn.Streams[dir]
+	stream := conn.streams[dir]
 	if stream == nil || stream.message == nil {
 		// nothing to do
 		return private, false
@@ -354,7 +342,7 @@ func (cbod *Cbod) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	}
 	if !ok {
 		// on errors, drop stream
-		conn.Streams[dir] = nil
+		conn.streams[dir] = nil
 		return conn, true
 	}
 
@@ -367,52 +355,43 @@ func (cbod *Cbod) GapInStream(tcptuple *common.TcpTuple, dir uint8,
 	return private, false
 }
 
-func (cbod *Cbod) RemovalListener(data protos.ProtocolData) {
-	if conn, ok := data.(*cbodConnectionData); ok {
-		if !conn.requests.empty() && conn.responses.empty() {
-			requ := conn.requests.pop()
-			resp := &message{
-				StatusCode: 700,
-			}
-			result := cbod.newTransaction(requ, resp)
-			cbod.results.PublishTransaction(result)
-		}
-	} else {
-		logp.Warn("Not a cbodConnectionData")
-	}
-}
-
-func (cbod *Cbod) handleCbod(
+func (cbod *cbodPlugin) handleCbod(
 	conn *cbodConnectionData,
 	m *message,
-	tcptuple *common.TcpTuple,
+	tcptuple *common.TCPTuple,
 	dir uint8,
 ) {
 
-	m.TCPTuple = *tcptuple
-	m.Direction = dir
-	m.CmdlineTuple = procs.ProcWatcher.FindProcessesTuple(tcptuple.IpPort())
+	m.tcpTuple = *tcptuple
+	m.direction = dir
+	m.cmdlineTuple = procs.ProcWatcher.FindProcessesTuple(tcptuple.IPPort())
 	cbod.hideHeaders(m)
 
-	if m.IsRequest {
+	if m.isRequest {
 		if isDebug {
-			debugf("Received request with tuple: %s", m.TCPTuple)
+			debugf("Received request with tuple: %s", m.tcpTuple)
+		}
+		if conn.requests.tail != nil {
+			for !conn.requests.empty() {
+				conn.requests.pop()
+			}
 		}
 		conn.requests.append(m)
 	} else {
 		if isDebug {
-			debugf("Received response with tuple: %s", m.TCPTuple)
+			debugf("Received response with tuple: %s", m.tcpTuple)
 		}
 		conn.responses.append(m)
 		cbod.correlate(conn)
 	}
 }
 
-func (cbod *Cbod) correlate(conn *cbodConnectionData) {
+func (cbod *cbodPlugin) correlate(conn *cbodConnectionData) {
 	// drop responses with missing requests
 	if conn.requests.empty() {
 		for !conn.responses.empty() {
-			logp.Warn("Response from unknown transaction. Ingoring.")
+			debugf("Response from unknown transaction. Ingoring.")
+			unmatchedResponses.Add(1)
 			conn.responses.pop()
 		}
 		return
@@ -431,89 +410,105 @@ func (cbod *Cbod) correlate(conn *cbodConnectionData) {
 	}
 }
 
-func (cbod *Cbod) newTransaction(requ, resp *message) common.MapStr {
+func (cbod *cbodPlugin) newTransaction(requ, resp *message) common.MapStr {
 	status := common.OK_STATUS
-	if resp.StatusCode >= 400 {
+	if resp.statusCode >= 400 {
 		status = common.ERROR_STATUS
 	}
 
 	// resp_time in milliseconds
-	responseTime := int32(resp.Ts.Sub(requ.Ts).Nanoseconds() / 1e6)
+	responseTime := int32(resp.ts.Sub(requ.ts).Nanoseconds() / 1e6)
 
 	src := common.Endpoint{
-		Ip:   requ.TCPTuple.Src_ip.String(),
-		Port: requ.TCPTuple.Src_port,
-		Proc: string(requ.CmdlineTuple.Src),
+		IP:   requ.tcpTuple.SrcIP.String(),
+		Port: requ.tcpTuple.SrcPort,
+		Proc: string(requ.cmdlineTuple.Src),
 	}
 	dst := common.Endpoint{
-		Ip:   requ.TCPTuple.Dst_ip.String(),
-		Port: requ.TCPTuple.Dst_port,
-		Proc: string(requ.CmdlineTuple.Dst),
+		IP:   requ.tcpTuple.DstIP.String(),
+		Port: requ.tcpTuple.DstPort,
+		Proc: string(requ.cmdlineTuple.Dst),
 	}
-	if requ.Direction == tcp.TcpDirectionReverse {
+	if requ.direction == tcp.TCPDirectionReverse {
 		src, dst = dst, src
 	}
 
-	ts := requ.Ts
-
 	event := common.MapStr{
-		"@timestamp":   common.Time(ts),
-		"status":       status,
+		"@timestamp":   common.Time(requ.ts),
 		"type":         "cbod",
+		"status":       status,
 		"responsetime": responseTime,
 		"src":          &src,
 		"dst":          &dst,
 		"tranCode": requ.cbodData["tranCode"],
 		"mfTranCode": requ.cbodData["mfTranCode"],
 		"retCode": resp.cbodData["retCode"],
-	}
-	
-	if resp.Ts.IsZero() {
-		event["respond_status"] = "FAIL"
-	}
 
-	if cbod.SendRequest {
-		event["request"] = string(cbod.cutMessageBody(requ))
-	}
-	if cbod.SendResponse {
-		event["response"] = string(cbod.cutMessageBody(resp))
-	}
-	if len(requ.Notes)+len(resp.Notes) > 0 {
-		event["notes"] = append(requ.Notes, resp.Notes...)
-	}
-	if len(requ.RealIP) > 0 {
-		event["real_ip"] = requ.RealIP
 	}
 
 	return event
 }
 
-func (cbod *Cbod) publishTransaction(event common.MapStr) {
+func (cbod *cbodPlugin) publishTransaction(event common.MapStr) {
 	if cbod.results == nil {
 		return
 	}
 	cbod.results.PublishTransaction(event)
 }
 
-func (cbod *Cbod) collectHeaders(m *message) interface{} {
-	if !cbod.SplitCookie {
-		return m.Headers
+func (cbod *cbodPlugin) RemovalListener(data protos.ProtocolData) {
+	if conn, ok := data.(*cbodConnectionData); ok {
+		if !conn.requests.empty() && conn.responses.empty() {
+			requ := conn.requests.pop()
+			resp := &message{
+				statusCode: 700,
+			}
+			result := cbod.newTransaction(requ, resp)
+			cbod.results.PublishTransaction(result)
+		}
+	} else {
+		logp.Warn("Not a cbodConnectionData")
 	}
+}
 
-	cookie := "cookie"
-	if !m.IsRequest {
-		cookie = "set-cookie"
-	}
+func (cbod *cbodPlugin) collectHeaders(m *message) interface{} {
 
 	hdrs := map[string]interface{}{}
-	for name, value := range m.Headers {
-		if name == cookie {
-			hdrs[name] = splitCookiesHeader(string(value))
-		} else {
-			hdrs[name] = value
+
+	hdrs["content-length"] = m.contentLength
+	if len(m.contentType) > 0 {
+		hdrs["content-type"] = m.contentType
+	}
+
+	if cbod.parserConfig.sendHeaders {
+
+		cookie := "cookie"
+		if !m.isRequest {
+			cookie = "set-cookie"
+		}
+
+		for name, value := range m.headers {
+			if strings.ToLower(name) == "content-type" {
+				continue
+			}
+			if strings.ToLower(name) == "content-length" {
+				continue
+			}
+			if cbod.splitCookie && name == cookie {
+				hdrs[name] = splitCookiesHeader(string(value))
+			} else {
+				hdrs[name] = value
+			}
 		}
 	}
 	return hdrs
+}
+
+func (cbod *cbodPlugin) setBody(result common.MapStr, m *message) {
+	body := string(cbod.extractBody(m))
+	if len(body) > 0 {
+		result["body"] = body
+	}
 }
 
 func splitCookiesHeader(headerVal string) map[string]string {
@@ -539,37 +534,58 @@ func parseCookieValue(raw string) string {
 	return raw
 }
 
-func (cbod *Cbod) cutMessageBody(m *message) []byte {
-	cutMsg := []byte{}
+func (cbod *cbodPlugin) extractBody(m *message) []byte {
+	body := []byte{}
 
-	// add headers always
-	cutMsg = m.Raw[:m.bodyOffset]
-
-	// add body
-	if len(m.ContentType) == 0 || cbod.shouldIncludeInBody(m.ContentType) {
+	if len(m.contentType) > 0 && cbod.shouldIncludeInBody(m.contentType) {
 		if len(m.chunkedBody) > 0 {
-			cutMsg = append(cutMsg, m.chunkedBody...)
+			body = append(body, m.chunkedBody...)
 		} else {
 			if isDebug {
-				debugf("Body to include: [%s]", m.Raw[m.bodyOffset:])
+				debugf("Body to include: [%s]", m.raw[m.bodyOffset:])
 			}
-			cutMsg = append(cutMsg, m.Raw[m.bodyOffset:]...)
+			body = append(body, m.raw[m.bodyOffset:]...)
 		}
 	}
 
-	return cutMsg
+	return body
 }
 
-func (cbod *Cbod) shouldIncludeInBody(contenttype []byte) bool {
+func (cbod *cbodPlugin) cutMessageBody(m *message) []byte {
+	cutMsg := []byte{}
+
+	// add headers always
+	cutMsg = m.raw[:m.bodyOffset]
+
+	// add body
+	return append(cutMsg, cbod.extractBody(m)...)
+
+}
+
+func (cbod *cbodPlugin) shouldIncludeInBody(contenttype []byte) bool {
+	includedBodies := cbod.includeBodyFor
+	for _, include := range includedBodies {
+		if bytes.Contains(contenttype, []byte(include)) {
+			if isDebug {
+				debugf("Should Include Body = true Content-Type %s include_body %s",
+					contenttype, include)
+			}
+			return true
+		}
+		if isDebug {
+			debugf("Should Include Body = false Content-Type %s include_body %s",
+				contenttype, include)
+		}
+	}
 	return false
 }
 
-func (cbod *Cbod) hideHeaders(m *message) {
-	if !m.IsRequest || !cbod.RedactAuthorization {
+func (cbod *cbodPlugin) hideHeaders(m *message) {
+	if !m.isRequest || !cbod.redactAuthorization {
 		return
 	}
 
-	msg := m.Raw
+	msg := m.raw
 
 	// byte64 != encryption, so obscure it in headers in case of Basic Authentication
 
@@ -611,15 +627,15 @@ func (cbod *Cbod) hideHeaders(m *message) {
 	}
 
 	for _, header := range redactHeaders {
-		if len(m.Headers[header]) > 0 {
-			m.Headers[header] = []byte("*")
+		if len(m.headers[header]) > 0 {
+			m.headers[header] = []byte("*")
 		}
 	}
 
-	m.Raw = msg
+	m.raw = msg
 }
 
-func (cbod *Cbod) hideSecrets(values url.Values) url.Values {
+func (cbod *cbodPlugin) hideSecrets(values url.Values) url.Values {
 	params := url.Values{}
 	for key, array := range values {
 		for _, value := range array {
@@ -635,11 +651,11 @@ func (cbod *Cbod) hideSecrets(values url.Values) url.Values {
 
 // extractParameters parses the URL and the form parameters and replaces the secrets
 // with the string xxxxx. The parameters containing secrets are defined in cbod.Hide_secrets.
-// Returns the Request URI path and the (ajdusted) parameters.
-func (cbod *Cbod) extractParameters(m *message, msg []byte) (path string, params string, err error) {
+// Returns the Request URI path and the (adjusted) parameters.
+func (cbod *cbodPlugin) extractParameters(m *message, msg []byte) (path string, params string, err error) {
 	var values url.Values
 
-	u, err := url.Parse(string(m.RequestURI))
+	u, err := url.Parse(string(m.requestURI))
 	if err != nil {
 		return
 	}
@@ -648,7 +664,8 @@ func (cbod *Cbod) extractParameters(m *message, msg []byte) (path string, params
 
 	paramsMap := cbod.hideSecrets(values)
 
-	if m.ContentLength > 0 && bytes.Contains(m.ContentType, []byte("urlencoded")) {
+	if m.contentLength > 0 && bytes.Contains(m.contentType, []byte("urlencoded")) {
+
 		values, err = url.ParseQuery(string(msg[m.bodyOffset:]))
 		if err != nil {
 			return
@@ -658,17 +675,16 @@ func (cbod *Cbod) extractParameters(m *message, msg []byte) (path string, params
 			paramsMap[key] = value
 		}
 	}
+
 	params = paramsMap.Encode()
-
 	if isDetailed {
-		detailedf("Parameters: %s", params)
+		detailedf("Form parameters: %s", params)
 	}
-
 	return
 }
 
-func (cbod *Cbod) isSecretParameter(key string) bool {
-	for _, keyword := range cbod.HideKeywords {
+func (cbod *cbodPlugin) isSecretParameter(key string) bool {
+	for _, keyword := range cbod.hideKeywords {
 		if strings.ToLower(key) == keyword {
 			return true
 		}

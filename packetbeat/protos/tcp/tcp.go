@@ -32,14 +32,6 @@ type Processor interface {
 	Process(flow *flows.FlowID, hdr *layers.TCP, pkt *protos.Packet)
 }
 
-type seqCompare int
-
-const (
-	seqLT seqCompare = -1
-	seqEq seqCompare = 0
-	seqGT seqCompare = 1
-)
-
 var (
 	droppedBecauseOfGaps = expvar.NewInt("tcp.dropped_because_of_gaps")
 )
@@ -266,18 +258,6 @@ func tcpSeqCompare(seq1, seq2 uint32) seqCompare {
 	}
 }
 
-func tcpSeqCompare(seq1, seq2 uint32) seqCompare {
-	i := int32(seq1 - seq2)
-	switch {
-	case i == 0:
-		return seqEq
-	case i < 0:
-		return seqLT
-	default:
-		return seqGT
-	}
-}
-
 func tcpSeqBefore(seq1 uint32, seq2 uint32) bool {
 	return int32(seq1-seq2) < 0
 }
@@ -333,13 +313,13 @@ func NewTCP(p protos.Protocols) (*TCP, error) {
 	return tcp, nil
 }
 
-func (tcp *Tcp) removalListener(k common.Key, v common.Value){
-	if conn, ok := v.(*TcpConnection); ok {
+func (tcp *TCP) removalListener(k common.Key, v common.Value){
+	if conn, ok := v.(*TCPConnection); ok {	
 		if conn.data == nil {
 			return
 		}
 		
-		mod := conn.tcp.protocols.GetTcp(conn.protocol)
+		mod := conn.tcp.protocols.GetTCP(conn.protocol)
 		mod.RemovalListener(conn.data)
 	}
 }

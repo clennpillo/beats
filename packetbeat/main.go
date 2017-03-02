@@ -18,6 +18,16 @@ import (
 	_ "github.com/elastic/beats/packetbeat/protos/pgsql"
 	_ "github.com/elastic/beats/packetbeat/protos/redis"
 	_ "github.com/elastic/beats/packetbeat/protos/thrift"
+	
+	// Adding protocols
+	_ "github.com/elastic/beats/packetbeat/protos/mq"
+	_ "github.com/elastic/beats/packetbeat/protos/ctg"
+	_ "github.com/elastic/beats/packetbeat/protos/cbod"
+	_ "github.com/elastic/beats/packetbeat/protos/encrypt"
+	_ "github.com/elastic/beats/packetbeat/protos/esb"
+	_ "github.com/elastic/beats/packetbeat/protos/taicang"
+	_ "github.com/elastic/beats/packetbeat/protos/afa"
+	_ "github.com/elastic/beats/packetbeat/protos/afa2"
 )
 
 var Name = "packetbeat"

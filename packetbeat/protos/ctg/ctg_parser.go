@@ -5,58 +5,53 @@ import (
 	"time"
 
 	"github.com/elastic/beats/libbeat/common"
-	"github.com/elastic/beats/libbeat/common/streambuf"
 	"github.com/elastic/beats/packetbeat/protos/lib"
+	"github.com/elastic/beats/libbeat/common/streambuf"
 	"encoding/binary"
 )
 
-// Ctg Message
+// ctg Message
 type message struct {
-	Ts               time.Time
+	ts               time.Time
 	hasContentLength bool
 	headerOffset     int
-	bodyOffset       int
 	version          version
 	connection       common.NetString
 	chunkedLength    int
 	chunkedBody      []byte
 
-	IsRequest    bool
-	TCPTuple     common.TcpTuple
-	CmdlineTuple *common.CmdlineTuple
-	Direction    uint8
+	isRequest    bool
+	tcpTuple     common.TCPTuple
+	cmdlineTuple *common.CmdlineTuple
+	direction    uint8
 
 	//Request Info
-	RequestURI   common.NetString
-	Method       common.NetString
-	StatusCode   uint16
-	StatusPhrase common.NetString
-	RealIP       common.NetString
+	requestURI   common.NetString
+	method       common.NetString
+	statusCode   uint16
+	statusPhrase common.NetString
+	realIP       common.NetString
 
-	// Http Headers
-	ContentLength    int
-	ContentType      common.NetString
-	TransferEncoding common.NetString
-	Headers          map[string]common.NetString
-	Size             uint64
+	// ctg Headers
+	contentLength    int
+	contentType      common.NetString
+	transferEncoding common.NetString
+	headers          map[string]common.NetString
+	size             uint64
 
 	//Raw Data
-	Raw []byte
+	raw []byte
 
-	Notes []string
+	notes []string
 
-	//Timing
-	start int
-	end   int
-	
-	CtgType string
-	
-	msgId string
-	correlId string
-	
-	cbodData map[string]interface{}
+	//Offsets
+	start      int
+	end        int
+	bodyOffset int
 
 	next *message
+	
+	cbodData map[string]interface{}
 }
 
 type version struct {
@@ -69,10 +64,10 @@ type parser struct {
 }
 
 type parserConfig struct {
-	RealIPHeader     string
-	SendHeaders      bool
-	SendAllHeaders   bool
-	HeadersWhitelist map[string]bool
+	realIPHeader     string
+	sendHeaders      bool
+	sendAllHeaders   bool
+	headersWhitelist map[string]bool
 }
 
 var (
@@ -93,8 +88,17 @@ func newParser(config *parserConfig) *parser {
 	return &parser{config: config}
 }
 
-func (parser *parser) parse(s *stream) (bool, bool) {
+func (parser *parser) parse(s *stream, extraMsgSize int) (bool, bool) {
 	m := s.message
+
+//	if extraMsgSize > 0 {
+//		// A packet of extraMsgSize size was seen, but we don't have
+//		// its actual bytes. This is only usable in the `stateBody` state.
+//		if s.parseState != stateBody {
+//			return false, false
+//		}
+//		return parser.eatBody(s, m, extraMsgSize)
+//	}
 
 	if cont, ok, complete := parser.parseCtgSign(s, m); !cont {
 		return ok, complete
@@ -105,7 +109,7 @@ func (parser *parser) parse(s *stream) (bool, bool) {
 
 func (*parser) parseCtgSign(s *stream, m *message) (cont, ok, complete bool) {
 	m.start = s.parseOffset
-
+	
 	if !bytes.Equal(s.data[0:6], []byte("\x47\x61\x74\x65\x00\x50")){
 		return false, false, false
 	}
@@ -126,7 +130,7 @@ func (*parser) parseCtgSign(s *stream, m *message) (cont, ok, complete bool) {
 	if bytes.Equal(s.data[11:12], []byte("\x01")){
 	   
 	    //REQUEST
-		m.IsRequest = true
+		m.isRequest = true
     	
 	    m.cbodData = lib.ParseCBODIn(s.data[107:len(s.data)])
 
@@ -142,7 +146,7 @@ func (*parser) parseCtgSign(s *stream, m *message) (cont, ok, complete bool) {
 	if bytes.Equal(s.data[11:12], []byte("\x03")){
 	          	
 		// RESPONSE
-		m.IsRequest = false
+		m.isRequest = false
 		
 	    m.cbodData = lib.ParseCBODOut(s.data[62:len(s.data)])
 	    
@@ -157,15 +161,11 @@ func (*parser) parseCtgSign(s *stream, m *message) (cont, ok, complete bool) {
 	}
 
 	// ok so far
-//	s.parseOffset = len(s.data)
-	//m.headerOffset = s.parseOffset
-	//s.parseState = stateHeaders
+	s.parseOffset = m.end
+	m.headerOffset = s.parseOffset
+	s.parseState = stateHeaders
 
-	return false, false, false
-}
-
-func isVersion(v version, major, minor uint8) bool {
-	return v.major == major && v.minor == minor
+	return true, true, true
 }
 
 func trim(buf []byte) []byte {
@@ -193,7 +193,7 @@ func trimRight(buf []byte) []byte {
 
 func parseInt(line []byte) (int, error) {
 	buf := streambuf.NewFixed(line)
-	i, err := buf.AsciiInt(false)
+	i, err := buf.IntASCII(false)
 	return int(i), err
 	// TODO: is it an error if 'buf.Len() != 0 {}' ?
 }
